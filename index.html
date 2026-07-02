@@ -1,0 +1,1556 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#020617">
+  <title>Benjamin Drives — GPS + Gamified Driving Challenges</title>
+  <meta name="description" content="A web-based GPS app combining live navigation with gamified driving challenges.">
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>tailwind.config = { darkMode: 'class' }</script>
+  <style>
+    html, body { height: 100%; margin: 0; overscroll-behavior: none; }
+    body { background: #020617; color: white; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; }
+    #root { height: 100dvh; }
+    .maplibregl-ctrl-attrib { background: rgba(2,6,23,0.6) !important; color: rgba(255,255,255,0.5) !important; font-size: 9px !important; border-radius: 6px 0 0 0; }
+    .maplibregl-ctrl-attrib a { color: rgba(34,211,238,0.7) !important; }
+    .maplibregl-canvas:focus { outline: none; }
+    .hzn-scroll::-webkit-scrollbar { width: 6px; }
+    .hzn-scroll::-webkit-scrollbar-thumb { background: rgba(34,211,238,0.3); border-radius: 3px; }
+    @keyframes slideUp { from { transform: translateY(60px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+    @keyframes slideDown { from { transform: translateY(-80px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+    @keyframes slideLeft { from { transform: translateX(40px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+    @keyframes scaleIn { from { transform: scale(0.7); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+    @keyframes ping { 75%, 100% { transform: scale(2); opacity: 0; } }
+    @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+    .animate-slideUp { animation: slideUp 0.3s ease-out; }
+    .animate-slideDown { animation: slideDown 0.3s ease-out; }
+    .animate-slideLeft { animation: slideLeft 0.3s ease-out; }
+    .animate-scaleIn { animation: scaleIn 0.3s ease-out; }
+    .animate-ping-slow { animation: ping 2s cubic-bezier(0,0,0.2,1) infinite; }
+    .animate-spin { animation: spin 1s linear infinite; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.js"></script>
+  <script src="https://unpkg.com/@turf/turf@7/turf.min.js"></script>
+  <script src="https://unpkg.com/canvas-confetti@1.9.4/dist/confetti.browser.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script type="text/babel" data-presets="react">
+    const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+    // ===== Mini Zustand-compatible store factory =====
+    function create(initializer) {
+      let state;
+      const listeners = new Set();
+      const setState = (partial) => {
+        const nextPartial = typeof partial === 'function' ? partial(state) : partial;
+        if (nextPartial !== state) {
+          state = Object.assign({}, state, nextPartial);
+          listeners.forEach((l) => l());
+        }
+      };
+      const getState = () => state;
+      const subscribe = (listener) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      };
+      state = initializer(setState, getState);
+      function useStore(selector) {
+        const sel = selector || ((s) => s);
+        const getSlice = () => sel(state);
+        const [slice, setSlice] = useState(getSlice);
+        const sliceRef = useRef(slice);
+        sliceRef.current = slice;
+        useEffect(() => {
+          const unsub = subscribe(() => {
+            const next = sel(getState());
+            if (!Object.is(next, sliceRef.current)) {
+              sliceRef.current = next;
+              setSlice(next);
+            }
+          });
+          return unsub;
+        }, []);
+        return slice;
+      }
+      useStore.setState = setState;
+      useStore.getState = getState;
+      useStore.subscribe = subscribe;
+      return useStore;
+    }
+
+    
+// ===== Geo utilities =====
+const EARTH_RADIUS_M = 6371000;
+const toRad = (d) => (d * Math.PI) / 180;
+const toDeg = (r) => (r * 180) / Math.PI;
+
+function haversineMetres(a, b) {
+  const dLat = toRad(b[1] - a[1]);
+  const dLng = toRad(b[0] - a[0]);
+  const h = Math.sin(dLat/2)**2 + Math.cos(toRad(a[1]))*Math.cos(toRad(b[1]))*Math.sin(dLng/2)**2;
+  return 2 * EARTH_RADIUS_M * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+function isPointInPolygon(p, ring) {
+  if (ring.length < 3) return false;
+  const r = (ring[0][0] === ring[ring.length-1][0] && ring[0][1] === ring[ring.length-1][1]) ? ring : [...ring, ring[0]];
+  return turf.booleanPointInPolygon(turf.point(p), turf.polygon([r]));
+}
+
+// Generate a circular polygon (GeoJSON ring) approximating a circle of
+// `radiusMetres` centred at `centre`. MapLibre has no native circle layer,
+// so we approximate with a 64-sided polygon.
+function circleToPolygon(centre, radiusMetres, segments = 64) {
+  const [lng, lat] = centre;
+  const latRad = (lat * Math.PI) / 180;
+  const mPerDegLat = 111320;
+  const mPerDegLng = 111320 * Math.cos(latRad);
+  const ring = [];
+  for (let i = 0; i < segments; i++) {
+    const angle = (i / segments) * 2 * Math.PI;
+    const dLat = (Math.sin(angle) * radiusMetres) / mPerDegLat;
+    const dLng = (Math.cos(angle) * radiusMetres) / mPerDegLng;
+    ring.push([lng + dLng, lat + dLat]);
+  }
+  ring.push(ring[0]); // close the ring
+  return ring;
+}
+
+const msToKmh = (ms) => ms * 3.6;
+const msToMph = (ms) => ms * 2.236936;
+
+// ===== Challenge serializer (Base64 URL-safe) =====
+function bytesToBase64Url(bytes) {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function base64UrlToBytes(s) {
+  const std = s.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = std.padEnd(std.length + ((4 - std.length % 4) % 4), '=');
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+function encodeChallenge(challenge, author) {
+  const envelope = { v: 1, createdAt: new Date().toISOString(), author, c: challenge };
+  return bytesToBase64Url(new TextEncoder().encode(JSON.stringify(envelope)));
+}
+function decodeChallenge(encoded) {
+  const clean = encoded.trim().replace(/\s/g, '');
+  if (!clean) throw new Error('Empty challenge payload');
+  const json = new TextDecoder().decode(base64UrlToBytes(clean));
+  const env = JSON.parse(json);
+  if (env.v !== 1) throw new Error('Unsupported schema version');
+  if (!env.c) throw new Error('Missing challenge payload');
+  return env.c;
+}
+function buildShareUrl(challenge, author) {
+  const origin = typeof window !== 'undefined' ? window.location.origin.split('?')[0] : 'https://benjamindrives.app';
+  // For GitHub Pages, ensure path is just / (no index.html)
+  const path = window.location.pathname.replace(/index\.html$/, '');
+  return `${origin}${path}?challenge=${encodeChallenge(challenge, author)}`;
+}
+function readChallengeFromUrl(search) {
+  const params = new URLSearchParams(search);
+  const raw = params.get('challenge');
+  if (!raw) return null;
+  return decodeChallenge(raw);
+}
+
+// ===== Routing (Nominatim + OSRM) =====
+async function geocode(query, limit = 6) {
+  const trimmed = query.trim();
+  if (!trimmed) return [];
+  const url = new URL('https://nominatim.openstreetmap.org/search');
+  url.searchParams.set('q', trimmed);
+  url.searchParams.set('format', 'json');
+  url.searchParams.set('limit', String(limit));
+  url.searchParams.set('addressdetails', '1');
+  const res = await fetch(url.toString(), { headers: { Accept: 'application/json' } });
+  if (!res.ok) throw new Error(`Nominatim error: ${res.status}`);
+  const data = await res.json();
+  return data.map((row) => {
+    const parts = row.display_name.split(',');
+    return {
+      displayName: row.display_name,
+      shortName: row.name || parts[0] || row.display_name,
+      position: [Number(row.lon), Number(row.lat)],
+    };
+  });
+}
+
+function formatInstruction(type, modifier, name) {
+  const road = name || 'the road';
+  const onto = `onto ${road}`;
+  switch (type) {
+    case 'depart': return `Head ${modifier || 'out'} ${onto}`;
+    case 'arrive': return 'Arrive at your destination';
+    case 'turn': return `Turn ${modifier || 'right'} ${onto}`;
+    case 'merge': return `Merge ${modifier || 'right'} ${onto}`;
+    case 'on ramp': return `Take the ramp ${onto}`;
+    case 'off ramp': return `Take the exit ${onto}`;
+    case 'fork': return `Keep ${modifier || 'left'} at the fork ${onto}`;
+    case 'end of road': return `Turn ${modifier || 'right'} at the end of the road ${onto}`;
+    case 'continue': return `Continue ${modifier || 'straight'} ${onto}`;
+    case 'roundabout':
+    case 'rotary': return `Enter the roundabout and continue ${onto}`;
+    case 'roundabout turn': return `At the roundabout, turn ${modifier || 'right'} ${onto}`;
+    case 'exit roundabout':
+    case 'exit rotary': return 'Exit the roundabout';
+    default: return `Continue ${onto}`;
+  }
+}
+
+async function fetchRoute(origin, destination) {
+  const url = new URL(`https://router.project-osrm.org/route/v1/driving/${origin[0]},${origin[1]};${destination[0]},${destination[1]}`);
+  url.searchParams.set('overview', 'full');
+  url.searchParams.set('geometries', 'geojson');
+  url.searchParams.set('steps', 'true');
+  const res = await fetch(url.toString());
+  if (!res.ok) throw new Error(`OSRM error: ${res.status}`);
+  const data = await res.json();
+  if (data.code !== 'Ok' || !data.routes?.length) throw new Error(data.message || 'No route found');
+  const route = data.routes[0];
+  const steps = [];
+  for (const leg of (route.legs || [])) {
+    for (const s of (leg.steps || [])) {
+      const m = s.maneuver || {};
+      const type = m.type || 'notification';
+      const name = s.name || '';
+      steps.push({
+        geometry: s.geometry || { type: 'LineString', coordinates: [] },
+        distance: s.distance || 0,
+        duration: s.duration || 0,
+        name,
+        maneuver: { type, modifier: m.modifier, location: m.location || [0, 0] },
+        instruction: formatInstruction(type, m.modifier, name),
+      });
+    }
+  }
+  return { geometry: route.geometry, distance: route.distance || 0, duration: route.duration || 0, steps };
+}
+
+function formatDistance(metres) {
+  if (metres < 1000) return `${Math.round(metres / 10) * 10} m`;
+  return `${(metres / 1000).toFixed(metres < 10000 ? 1 : 0)} km`;
+}
+function formatDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '—';
+  const m = Math.round(seconds / 60);
+  if (m < 60) return `${m} min`;
+  return `${Math.floor(m/60)}h ${m%60}m`;
+}
+function formatEtaClock(seconds) {
+  return new Date(Date.now() + seconds * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+// ===== Challenge evaluator =====
+function evaluateRadar(speedKmh, targets) {
+  let stars = 0;
+  if (speedKmh >= targets[0]) stars = 1;
+  if (speedKmh >= targets[1]) stars = 2;
+  if (speedKmh >= targets[2]) stars = 3;
+  return stars;
+}
+function evaluateTrack(completionSeconds, timeTargets) {
+  if (completionSeconds <= timeTargets[0]) return 3;
+  if (completionSeconds <= timeTargets[1]) return 2;
+  if (completionSeconds <= timeTargets[2]) return 1;
+  return 0;
+}
+function evaluateChallenge(challenge, metric) {
+  if (challenge.kind === 'radar') {
+    return { stars: evaluateRadar(metric, challenge.targets), metricLabel: `${Math.round(metric)} km/h` };
+  }
+  return { stars: evaluateTrack(metric, challenge.timeTargets), metricLabel: `${metric.toFixed(1)}s` };
+}
+
+// ===== Presets (empty — user creates their own challenges) =====
+const PRESET_CHALLENGES = [];
+const DEFAULT_VIEW = { center: [-3.7038, 40.4168], zoom: 12 };
+
+// ===== LocalStorage persistence (progress + user-created challenges) =====
+const STORAGE_KEY = 'horizon-drive:progress:v1';
+const CHALLENGES_KEY = 'horizon-drive:challenges:v1';
+
+function loadProgress() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return { totalStars: 0, totalScore: 0, bestMultiplier: 1, records: {} };
+    const p = JSON.parse(raw);
+    return { totalStars: p.totalStars || 0, totalScore: p.totalScore || 0, bestMultiplier: p.bestMultiplier || 1, records: p.records || {} };
+  } catch { return { totalStars: 0, totalScore: 0, bestMultiplier: 1, records: {} }; }
+}
+function saveProgress(p) { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(p)); } catch {} }
+
+// Load user-created challenges from localStorage so they survive browser restarts.
+function loadChallenges() {
+  try {
+    const raw = localStorage.getItem(CHALLENGES_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    // Basic shape validation — only keep objects with an id and a known kind.
+    return parsed.filter((c) => c && typeof c === 'object' && typeof c.id === 'string' && (c.kind === 'radar' || c.kind === 'track'));
+  } catch { return []; }
+}
+function saveChallenges(challenges) { try { localStorage.setItem(CHALLENGES_KEY, JSON.stringify(challenges)); } catch {} }
+
+    
+// ===== Zustand store =====
+function computeNewMultiplier(current, lastAt, now) {
+  if (lastAt === null) return 1;
+  if ((now - lastAt) / 1000 > 60) return 1;
+  return Math.min(10, current + 0.5);
+}
+
+const useHorizonStore = create((set, get) => ({
+  // Map / view
+  mapStyle: 'gta',
+  followUser: true,
+  mapMode: 'drive', // 'drive' | 'create-radar' | 'create-track' | 'set-destination'
+  draftTrackPoints: [],
+  draftRadarPosition: null,
+  draftRadius: 50,
+  // Geo
+  geo: null,
+  geoPermission: 'unknown',
+  geoError: null,
+  // Challenges — load saved user-created challenges from localStorage on boot
+  challenges: loadChallenges(),
+  importedChallenge: null,
+  activeAttempt: null,
+  pendingResult: null,
+  // Navigation
+  destination: null,
+  destinationPin: null,
+  route: null,
+  routeLoading: false,
+  routeError: null,
+  isNavigating: false,
+  currentStepIndex: 0,
+  // Gamification
+  multiplier: 1,
+  lastCompletionAt: null,
+  progress: loadProgress(),
+
+  setMapStyle: (s) => set({ mapStyle: s }),
+  setFollowUser: (v) => set({ followUser: v }),
+  setMapMode: (m) => set({ mapMode: m, draftRadarPosition: null, draftTrackPoints: [], draftRadius: 50 }),
+  setDraftRadarPosition: (p) => set({ draftRadarPosition: p }),
+  setDraftRadius: (r) => set({ draftRadius: r }),
+  addDraftTrackPoint: (p) => set((s) => ({ draftTrackPoints: [...s.draftTrackPoints, p] })),
+  clearDraft: () => set({ draftRadarPosition: null, draftTrackPoints: [], draftRadius: 50 }),
+
+  setGeo: (g) => set({ geo: g }),
+  setGeoPermission: (p) => set({ geoPermission: p }),
+  setGeoError: (e) => set({ geoError: e }),
+
+  addChallenge: (c) => set((s) => {
+    const challenges = [...s.challenges.filter((x) => x.id !== c.id), c];
+    // Persist to localStorage so the challenge survives browser restarts.
+    saveChallenges(challenges);
+    return { challenges };
+  }),
+  removeChallenge: (id) => set((s) => {
+    const challenges = s.challenges.filter((x) => x.id !== id);
+    saveChallenges(challenges);
+    return { challenges };
+  }),
+  setImportedChallenge: (c) => set({ importedChallenge: c }),
+
+  startAttempt: (challengeId) => set({ activeAttempt: { challengeId, startedAt: Date.now(), boundaryBreaches: 0, started: false } }),
+  cancelAttempt: () => set({ activeAttempt: null }),
+  registerBoundaryBreach: () => set((s) => s.activeAttempt ? { activeAttempt: { ...s.activeAttempt, boundaryBreaches: s.activeAttempt.boundaryBreaches + 1 } } : {}),
+
+  finishAttempt: ({ challengeId, challengeName, stars, metric, metricLabel, kind }) => {
+    const state = get();
+    const now = Date.now();
+    const newMult = computeNewMultiplier(state.multiplier, state.lastCompletionAt, now);
+    const scoreAwarded = stars * 100 * newMult;
+    const prev = state.progress.records[challengeId];
+    const isPB = !prev || (kind === 'radar' ? metric > prev.bestMetric : metric < prev.bestMetric);
+    const newRecord = { challengeId, bestStars: Math.max(prev?.bestStars || 0, stars), bestMetric: isPB ? metric : prev.bestMetric, attempts: (prev?.attempts || 0) + 1, lastAttemptedAt: new Date().toISOString() };
+    const starDelta = stars - (prev?.bestStars || 0);
+    const newProgress = {
+      totalStars: Math.max(0, state.progress.totalStars + starDelta),
+      totalScore: state.progress.totalScore + scoreAwarded,
+      bestMultiplier: Math.max(state.progress.bestMultiplier, newMult),
+      records: { ...state.progress.records, [challengeId]: newRecord },
+    };
+    saveProgress(newProgress);
+    set({ progress: newProgress, activeAttempt: null, multiplier: newMult, lastCompletionAt: now, pendingResult: { challengeId, challengeName, stars, metricLabel, isPersonalBest: isPB, scoreAwarded } });
+  },
+  dismissPendingResult: () => set({ pendingResult: null }),
+
+  setDestination: (d) => set({ destination: d, route: null, routeError: null, currentStepIndex: 0, destinationPin: d ? null : get().destinationPin }),
+  setDestinationPin: (p) => set({ destinationPin: p, destination: p ? null : get().destination, route: null, routeError: null, currentStepIndex: 0 }),
+  setRoute: (r) => set({ route: r, currentStepIndex: 0 }),
+  setRouteLoading: (v) => set({ routeLoading: v }),
+  setRouteError: (e) => set({ routeError: e }),
+  startNavigation: () => set({ isNavigating: true, followUser: true, currentStepIndex: 0 }),
+  stopNavigation: () => set({ isNavigating: false }),
+  advanceStep: () => set((s) => ({ currentStepIndex: Math.min(s.currentStepIndex + 1, (s.route?.steps.length || 1) - 1) })),
+  setCurrentStepIndex: (i) => set({ currentStepIndex: i }),
+  clearNavigation: () => set({ destination: null, destinationPin: null, route: null, routeError: null, routeLoading: false, isNavigating: false, currentStepIndex: 0 }),
+}));
+
+    
+// ===== Hooks =====
+function useGeolocation(opts = {}) {
+  const { highAccuracy = true, throttleMs = 800 } = opts;
+  const setGeo = useHorizonStore((s) => s.setGeo);
+  const setGeoPermission = useHorizonStore((s) => s.setGeoPermission);
+  const setGeoError = useHorizonStore((s) => s.setGeoError);
+  const enabled = React.useRef(false);
+  React.useEffect(() => {
+    if (enabled.current) return;
+    if (!('geolocation' in navigator)) {
+      setGeoPermission('unavailable');
+      setGeoError('Geolocation is not supported by this browser.');
+      return;
+    }
+    enabled.current = true;
+    let watchId = null;
+    let lastEmit = 0;
+    watchId = navigator.geolocation.watchPosition(
+      (pos) => {
+        const { latitude, longitude, speed, heading, accuracy } = pos.coords;
+        const reading = {
+          position: [longitude, latitude],
+          speed: (speed == null || Number.isNaN(speed)) ? null : speed,
+          heading: (heading == null || Number.isNaN(heading)) ? null : heading,
+          timestamp: pos.timestamp,
+          accuracy,
+        };
+        const now = Date.now();
+        if (now - lastEmit >= throttleMs) {
+          lastEmit = now;
+          setGeo(reading);
+        }
+        setGeoPermission('granted');
+        setGeoError(null);
+      },
+      (err) => {
+        if (err.code === err.PERMISSION_DENIED) { setGeoPermission('denied'); setGeoError('Location permission denied. Enable it in your browser to use live navigation.'); }
+        else if (err.code === err.POSITION_UNAVAILABLE) { setGeoPermission('unavailable'); setGeoError('Position unavailable. Check your GPS / network.'); }
+        else setGeoError(err.message || 'Geolocation timeout.');
+      },
+      { enableHighAccuracy: highAccuracy, maximumAge: 0, timeout: 10000 },
+    );
+    return () => { if (watchId !== null) navigator.geolocation.clearWatch(watchId); enabled.current = false; };
+  }, [highAccuracy, throttleMs, setGeo, setGeoPermission, setGeoError]);
+}
+
+function requestGeolocationOnce() {
+  if (!('geolocation' in navigator)) return;
+  navigator.geolocation.getCurrentPosition(
+    () => useHorizonStore.getState().setGeoPermission('granted'),
+    (err) => { if (err.code === err.PERMISSION_DENIED) useHorizonStore.getState().setGeoPermission('denied'); },
+    { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 },
+  );
+}
+
+function useChallengeDetection() {
+  const geo = useHorizonStore((s) => s.geo);
+  const challenges = useHorizonStore((s) => s.challenges);
+  const active = useHorizonStore((s) => s.activeAttempt);
+  const startAttempt = useHorizonStore((s) => s.startAttempt);
+  const registerBreach = useHorizonStore((s) => s.registerBoundaryBreach);
+  const finishAttempt = useHorizonStore((s) => s.finishAttempt);
+  const cancelAttempt = useHorizonStore((s) => s.cancelAttempt);
+
+  // Per-radar cooldown timestamps (challengeId → epoch ms when it can fire again)
+  const radarCooldowns = React.useRef({});
+
+  // ---- 1. ALWAYS-ACTIVE RADAR PASSIVE DETECTION ----
+  // Runs on every GPS tick. If the player is inside a radar's zone (and not
+  // on cooldown), the radar fires automatically — no "Attempt" needed.
+  React.useEffect(() => {
+    if (!geo) return;
+    const now = Date.now();
+    for (const c of challenges) {
+      if (c.kind !== 'radar') continue;
+      // Skip if this radar is the current active attempt — active logic handles it
+      if (active?.challengeId === c.id) continue;
+      const radius = c.radius || 50;
+      const dist = haversineMetres(geo.position, c.position);
+      if (dist > radius) continue;
+      // Check cooldown (10s between firings of the same radar)
+      const cooldownUntil = radarCooldowns.current[c.id] || 0;
+      if (now < cooldownUntil) continue;
+      // Fire! Record speed, set cooldown, push result.
+      const speedKmh = geo.speed != null ? msToKmh(geo.speed) : 0;
+      const { stars, metricLabel } = evaluateChallenge(c, speedKmh);
+      radarCooldowns.current[c.id] = now + 10000;
+      finishAttempt({ challengeId: c.id, challengeName: c.name, stars, metric: speedKmh, metricLabel, kind: 'radar' });
+    }
+  }, [geo, challenges, active, finishAttempt]);
+
+  // ---- 2. ACTIVE ATTEMPT DETECTION (track limits + manual radars) ----
+  React.useEffect(() => {
+    if (!geo || !active) return;
+    const c = challenges.find((x) => x.id === active.challengeId);
+    if (!c) return;
+    if (c.kind === 'radar') {
+      const radius = c.radius || 50;
+      const dist = haversineMetres(geo.position, c.position);
+      if (dist <= radius) {
+        const speedKmh = geo.speed != null ? msToKmh(geo.speed) : 0;
+        const { stars, metricLabel } = evaluateChallenge(c, speedKmh);
+        radarCooldowns.current[c.id] = Date.now() + 10000;
+        finishAttempt({ challengeId: c.id, challengeName: c.name, stars, metric: speedKmh, metricLabel, kind: 'radar' });
+      }
+      return;
+    }
+    const distToFinish = haversineMetres(geo.position, c.finish);
+    if (active.started) {
+      const inside = isPointInPolygon(geo.position, c.boundary);
+      if (!inside) {
+        if (c.onLeaveBoundary === 'fail') {
+          cancelAttempt();
+          finishAttempt({ challengeId: c.id, challengeName: c.name, stars: 0, metric: 999999, metricLabel: 'DNF — out of bounds', kind: 'track' });
+          return;
+        }
+        registerBreach();
+      }
+    } else {
+      const distToStart = haversineMetres(geo.position, c.start);
+      if (distToStart <= 25) startAttempt(c.id);
+    }
+    if (active.started && distToFinish <= 25) {
+      const elapsed = (Date.now() - active.startedAt) / 1000;
+      const penalty = c.onLeaveBoundary === 'penalty' ? (c.penaltySeconds || 0) * active.boundaryBreaches : 0;
+      const total = elapsed + penalty;
+      const { stars, metricLabel } = evaluateChallenge(c, total);
+      finishAttempt({ challengeId: c.id, challengeName: c.name, stars, metric: total, metricLabel, kind: 'track' });
+    }
+  }, [geo, active, challenges, startAttempt, registerBreach, finishAttempt, cancelAttempt]);
+}
+
+function useNavigation() {
+  const geo = useHorizonStore((s) => s.geo);
+  const destination = useHorizonStore((s) => s.destination);
+  const destinationPin = useHorizonStore((s) => s.destinationPin);
+  const route = useHorizonStore((s) => s.route);
+  const isNavigating = useHorizonStore((s) => s.isNavigating);
+  const currentStepIndex = useHorizonStore((s) => s.currentStepIndex);
+  const setRoute = useHorizonStore((s) => s.setRoute);
+  const setRouteLoading = useHorizonStore((s) => s.setRouteLoading);
+  const setRouteError = useHorizonStore((s) => s.setRouteError);
+  const advanceStep = useHorizonStore((s) => s.advanceStep);
+  const stopNavigation = useHorizonStore((s) => s.stopNavigation);
+  const clearNavigation = useHorizonStore((s) => s.clearNavigation);
+
+  const lastFetchKey = React.useRef('');
+  React.useEffect(() => {
+    if (!geo) return;
+    const dest = destination?.position || destinationPin;
+    if (!dest) return;
+    const key = `${geo.position[0].toFixed(5)},${geo.position[1].toFixed(5)}→${dest[0].toFixed(5)},${dest[1].toFixed(5)}`;
+    if (key === lastFetchKey.current) return;
+    lastFetchKey.current = key;
+    let cancelled = false;
+    setRouteLoading(true);
+    setRouteError(null);
+    fetchRoute(geo.position, dest).then((r) => { if (!cancelled) { setRoute(r); setRouteLoading(false); } }).catch((err) => { if (!cancelled) { setRouteError(err?.message || 'Failed to fetch route'); setRouteLoading(false); } });
+    return () => { cancelled = true; };
+  }, [geo?.position[0], geo?.position[1], destination, destinationPin, setRoute, setRouteLoading, setRouteError]);
+
+  React.useEffect(() => {
+    if (!isNavigating) return;
+    const id = setInterval(() => { lastFetchKey.current = ''; }, 30000);
+    return () => clearInterval(id);
+  }, [isNavigating]);
+
+  React.useEffect(() => {
+    if (!isNavigating || !geo || !route) return;
+    const step = route.steps[currentStepIndex];
+    if (!step) return;
+    const dist = haversineMetres(geo.position, step.maneuver.location);
+    if (dist <= 35) {
+      if (currentStepIndex >= route.steps.length - 1) { stopNavigation(); return; }
+      advanceStep();
+    }
+    const dest = destination?.position || destinationPin;
+    if (dest) {
+      const dToDest = haversineMetres(geo.position, dest);
+      if (dToDest <= 25) stopNavigation();
+    }
+  }, [geo, route, currentStepIndex, isNavigating, destination, destinationPin, advanceStep, stopNavigation]);
+
+  React.useEffect(() => {
+    if (!destination && !destinationPin && route) clearNavigation();
+  }, [destination, destinationPin, route, clearNavigation]);
+}
+
+    
+// ===== Inline SVG icons (replaces lucide-react) =====
+const ICON_PATHS = {
+  search: 'M21 21l-4.35-4.35M11 19a8 8 0 100-16 8 8 0 000 16z',
+  mapPin: 'M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0118 0z M12 13a3 3 0 100-6 3 3 0 000 6z',
+  x: 'M18 6L6 18M6 6l12 12',
+  loader: 'M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83',
+  navigation: 'M3 11l19-9-9 19-2-8-8-2z',
+  crosshair: 'M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z M12 8v4 M12 16h.01 M12 2v2 M12 20v2 M2 12h2 M20 12h2',
+  radar: 'M19.07 4.93A10 10 0 014.93 19.07A10 10 0 0119.07 4.93z M12 12l4-4 M12 2v2 M2 12h2',
+  square: 'M3 3h18v18H3z',
+  flag: 'M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z M4 22V15',
+  list: 'M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01',
+  star: 'M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z',
+  gauge: 'M12 14l4-4 M3.34 19a10 10 0 1117.32 0',
+  layers: 'M12 2L2 7l10 5 10-5-10-5z M2 17l10 5 10-5 M2 12l10 5 10-5',
+  zap: 'M13 2L3 14h9l-1 8 10-12h-9l1-8z',
+  trophy: 'M6 9H4.5a2.5 2.5 0 010-5H6 M18 9h1.5a2.5 2.5 0 000-5H18 M4 22h16 M10 14.66V17c0 .55-.47.98-.97 1.21C7.85 18.75 7 20.24 7 22 M14 14.66V17c0 .55.47.98.97 1.21C16.15 18.75 17 20.24 17 22 M18 2H6v7a6 6 0 0012 0V2z',
+  rotateCcw: 'M1 4v6h6 M3.51 15a9 9 0 102.13-9.36L1 10',
+  sparkles: 'M12 3l1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5L12 3z M5 19l.7 2.1L8 22l-2.3.7L5 25l-.7-2.3L2 22l2.3-.9L5 19z',
+  play: 'M5 3l14 9-14 9V3z',
+  share: 'M4 12v8a2 2 0 002 2h12a2 2 0 002-2v-8 M16 6l-4-4-4 4 M12 2v13',
+  alert: 'M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z M12 9v4 M12 17h.01',
+  shield: 'M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z',
+  undo: 'M9 14l-4-4 4-4 M5 10h11a4 4 0 014 4v0a4 4 0 01-4 4h-4',
+  check: 'M20 6L9 17l-5-5',
+  chevronRight: 'M9 18l6-6-6-6',
+  inbox: 'M22 12h-6l-2 3h-4l-2-3H2 M5.45 5.11L2 12v6a2 2 0 002 2h16a2 2 0 002-2v-6l-3.45-6.89A2 2 0 0016.76 4H7.24a2 2 0 00-1.79 1.11z',
+  timer: 'M10 2h4 M12 14V8 M5 2h14 M12 22a10 10 0 100-20 10 10 0 000 20z',
+  externalLink: 'M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6 M15 3h6v6 M10 14L21 3',
+  copy: 'M16 4h2a2 2 0 012 2v14a2 2 0 01-2 2H6a2 2 0 01-2-2V6a2 2 0 012-2h2 M9 4h6v4H9z',
+  arrowUp: 'M12 19V5 M5 12l7-7 7 7',
+  arrowUpRight: 'M7 17L17 7 M7 7h10v10',
+  arrowUpLeft: 'M17 7L7 17 M17 17H7V7',
+  arrowRight: 'M5 12h14 M12 5l7 7-7 7',
+  arrowLeft: 'M19 12H5 M12 19l-7-7 7-7',
+  arrowDownRight: 'M7 7l10 10 M17 7v10H7',
+  arrowDownLeft: 'M17 7L7 17 M7 7v10h10',
+  cornerUpLeft: 'M9 14l-4-4 4-4 M5 10h11a4 4 0 014 4v0a4 4 0 01-4 4h-4',
+};
+
+function Icon({ name, className = '', size = 16 }) {
+  const path = ICON_PATHS[name];
+  if (!path) return null;
+  // For multi-part icons, split by ' M' to get separate paths
+  const parts = path.split(' M').map((p, i) => i === 0 ? p : 'M' + p);
+  return React.createElement('svg', {
+    xmlns: 'http://www.w3.org/2000/svg',
+    width: size, height: size, viewBox: '0 0 24 24',
+    fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round',
+    className,
+  }, ...parts.map((d) => React.createElement('path', { key: d, d })));
+}
+
+    
+// ===== Small UI components =====
+function StarRating({ value, total = 3, size = 24, animate = false }) {
+  return React.createElement('div', { className: 'flex items-center gap-1' },
+    ...Array.from({ length: total }, (_, i) => {
+      const earned = i < value;
+      const style = animate ? { animation: `scaleIn 0.4s ${i * 0.18}s both` } : {};
+      return React.createElement('div', { key: i, style },
+        React.createElement(Icon, {
+          name: 'star',
+          size,
+          className: earned ? 'text-amber-300' : 'text-white/15',
+        })
+      );
+    })
+  );
+}
+
+function SkillChainMeter() {
+  const multiplier = useHorizonStore((s) => s.multiplier);
+  const color = multiplier >= 7 ? '#ec4899' : multiplier >= 4 ? '#f59e0b' : multiplier >= 2 ? '#84cc16' : '#22d3ee';
+  return React.createElement('div', { className: 'flex items-center gap-2 rounded-full border border-white/15 bg-black/60 px-3 py-1.5 backdrop-blur' },
+    React.createElement(Icon, { name: 'zap', size: 14, className: '' , style: { color, filter: `drop-shadow(0 0 6px ${color})` } }),
+    React.createElement('span', { className: 'font-mono text-base font-bold tabular-nums', style: { color, textShadow: `0 0 8px ${color}` } }, multiplier.toFixed(1) + 'x'),
+    React.createElement('span', { className: 'hidden text-[10px] uppercase tracking-wider text-white/50 sm:inline' }, 'Chain'),
+  );
+}
+
+function SafetyDisclaimer() {
+  return React.createElement('div', { className: 'pointer-events-none absolute inset-x-0 bottom-0 z-10 flex justify-center px-3 pb-2' },
+    React.createElement('div', { className: 'pointer-events-auto flex max-w-[min(96vw,720px)] items-center gap-2 rounded-full border border-amber-400/20 bg-slate-950/80 px-3 py-1.5 text-[10px] text-amber-200/70 backdrop-blur sm:text-[11px]' },
+      React.createElement(Icon, { name: 'shield', size: 12, className: 'shrink-0 text-amber-300' }),
+      React.createElement('span', { className: 'truncate' }, 'Drive safely and obey real-world traffic laws. Benjamin Drives is for entertainment on closed courses or as a passenger.'),
+    ),
+  );
+}
+
+function GeoPermissionCard() {
+  const permission = useHorizonStore((s) => s.geoPermission);
+  const error = useHorizonStore((s) => s.geoError);
+  if (permission === 'granted') return null;
+  const isBad = permission === 'denied' || permission === 'unavailable';
+  return React.createElement('div', { className: 'absolute bottom-4 left-1/2 z-30 w-[min(92vw,440px)] -translate-x-1/2 overflow-hidden rounded-2xl border border-cyan-400/30 bg-slate-950/90 backdrop-blur animate-slideUp' },
+    React.createElement('div', { className: 'flex items-start gap-3 p-4' },
+      React.createElement('div', { className: `flex h-10 w-10 shrink-0 items-center justify-center rounded-full ${isBad ? 'bg-rose-500/20' : 'bg-cyan-500/20'}` },
+        React.createElement(Icon, { name: isBad ? 'alert' : 'mapPin', size: 20, className: isBad ? 'text-rose-300' : 'text-cyan-300' }),
+      ),
+      React.createElement('div', { className: 'flex-1' },
+        React.createElement('h3', { className: 'text-sm font-semibold text-white' }, permission === 'denied' ? 'Location permission blocked' : permission === 'unavailable' ? 'Geolocation unavailable' : 'Enable live navigation'),
+        React.createElement('p', { className: 'mt-1 text-xs text-white/60' }, error || 'Benjamin Drives needs your location to track your speed, detect challenge crossings, and render turn-by-turn navigation. Your position never leaves your device.'),
+        React.createElement('div', { className: 'mt-3 flex items-center gap-2' },
+          permission === 'unknown' && React.createElement('button', { onClick: requestGeolocationOnce, className: 'rounded-lg bg-gradient-to-r from-cyan-400 to-fuchsia-500 px-3 py-1.5 text-xs font-semibold text-black' }, 'Enable location'),
+          React.createElement('div', { className: 'flex items-center gap-1 text-[10px] text-white/40' }, React.createElement(Icon, { name: 'shield', size: 12 }), 'On-device only · No tracking'),
+        ),
+      ),
+    ),
+  );
+}
+
+function ImportedChallengeBanner() {
+  const imported = useHorizonStore((s) => s.importedChallenge);
+  const setImported = useHorizonStore((s) => s.setImportedChallenge);
+  const addChallenge = useHorizonStore((s) => s.addChallenge);
+  const startAttempt = useHorizonStore((s) => s.startAttempt);
+  if (!imported) return null;
+  const isRadar = imported.kind === 'radar';
+  const handleAttempt = () => { addChallenge(imported); startAttempt(imported.id); setImported(null); };
+  return React.createElement('div', { className: 'absolute left-1/2 top-20 z-30 w-[min(92vw,460px)] -translate-x-1/2 overflow-hidden rounded-2xl border border-cyan-400/40 bg-slate-950/95 shadow-[0_0_24px_rgba(34,211,238,0.4)] backdrop-blur animate-slideDown' },
+    React.createElement('div', { className: 'flex items-center gap-3 border-b border-white/10 bg-cyan-500/10 px-3 py-2' },
+      React.createElement(Icon, { name: 'share', size: 16, className: 'text-cyan-300' }),
+      React.createElement('div', { className: 'text-[10px] font-semibold uppercase tracking-widest text-cyan-200' }, 'Shared Challenge Imported'),
+      React.createElement('button', { onClick: () => setImported(null), className: 'ml-auto rounded-full p-1 text-white/50 hover:bg-white/10' }, React.createElement(Icon, { name: 'x', size: 14 })),
+    ),
+    React.createElement('div', { className: 'flex items-center gap-3 p-4' },
+      React.createElement('div', { className: `flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${isRadar ? 'bg-fuchsia-500/20' : 'bg-emerald-500/20'}` },
+        React.createElement(Icon, { name: isRadar ? 'radar' : 'flag', size: 20, className: isRadar ? 'text-fuchsia-300' : 'text-emerald-300' }),
+      ),
+      React.createElement('div', { className: 'min-w-0 flex-1' },
+        React.createElement('div', { className: 'truncate text-sm font-bold text-white' }, imported.name),
+        React.createElement('div', { className: 'text-[11px] text-white/60' }, isRadar ? `Speed Radar · targets ${imported.targets.join(' / ')} km/h` : `Track Limit · ${imported.timeTargets.join(' / ')}s cutoffs`),
+      ),
+      React.createElement('button', { onClick: handleAttempt, className: 'flex items-center gap-1.5 rounded-lg bg-gradient-to-r from-cyan-400 to-fuchsia-500 px-3 py-2 text-xs font-semibold text-black' }, React.createElement(Icon, { name: 'play', size: 14 }), 'Attempt'),
+    ),
+  );
+}
+
+    
+// ===== Speedometer (simplified — digital readout only, no needle) =====
+function Speedometer({ size = 170 }) {
+  const geo = useHorizonStore((s) => s.geo);
+  const speedKmh = geo?.speed != null ? msToKmh(geo.speed) : 0;
+  const speedMph = geo?.speed != null ? msToMph(geo.speed) : 0;
+  // Color shifts with speed: cyan at idle → amber at high → magenta at very high
+  const color = speedKmh >= 120 ? '#ec4899' : speedKmh >= 60 ? '#f59e0b' : '#22d3ee';
+  const digitSize = Math.round(size * 0.45);
+  return React.createElement('div', { className: 'relative select-none', style: { width: size, height: Math.round(size * 0.6) } },
+    // Outer glow
+    React.createElement('div', { className: 'absolute inset-0 rounded-2xl blur-xl', style: { background: `radial-gradient(circle, ${color}40 0%, transparent 70%)` } }),
+    React.createElement('div', {
+      className: 'relative flex h-full flex-col items-center justify-center rounded-2xl border bg-black/55 backdrop-blur-md',
+      style: { borderColor: `${color}55`, boxShadow: `0 0 18px ${color}30, inset 0 0 12px ${color}10` },
+    },
+      // Big digital readout
+      React.createElement('div', {
+        key: Math.round(speedKmh),
+        className: 'font-mono font-bold tabular-nums leading-none speedo-digit',
+        style: { fontSize: digitSize, color, textShadow: `0 0 12px ${color}, 0 0 24px ${color}60` },
+      }, Math.round(speedKmh)),
+      // Units row
+      React.createElement('div', { className: 'mt-1 flex items-center gap-2' },
+        React.createElement('span', { className: 'font-semibold tracking-widest', style: { fontSize: Math.round(size * 0.075), color: `${color}cc` } }, 'KM/H'),
+        React.createElement('span', { className: 'rounded-full border border-white/20 bg-black/40 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-white/70', style: { fontSize: Math.round(size * 0.065) } }, `${Math.round(speedMph)} mph`),
+      ),
+    ),
+  );
+}
+
+    
+// ===== Challenge result modal =====
+function ChallengeResultModal() {
+  const pending = useHorizonStore((s) => s.pendingResult);
+  const dismiss = useHorizonStore((s) => s.dismissPendingResult);
+  const startAttempt = useHorizonStore((s) => s.startAttempt);
+  const challenges = useHorizonStore((s) => s.challenges);
+  const fired = React.useRef(false);
+  React.useEffect(() => {
+    if (!pending || fired.current) return;
+    if (pending.stars <= 0) return;
+    fired.current = true;
+    const colors = pending.stars >= 3 ? ['#fbbf24','#ec4899','#22d3ee','#a78bfa'] : ['#22d3ee','#a78bfa','#fbbf24'];
+    confetti({ particleCount: 80, spread: 70, origin: { y: 0.25 }, colors, disableForReducedMotion: true });
+    if (pending.stars >= 3) {
+      setTimeout(() => {
+        confetti({ particleCount: 60, angle: 60, spread: 55, origin: { x: 0, y: 0.7 }, colors, disableForReducedMotion: true });
+        confetti({ particleCount: 60, angle: 120, spread: 55, origin: { x: 1, y: 0.7 }, colors, disableForReducedMotion: true });
+      }, 200);
+    }
+  }, [pending]);
+  React.useEffect(() => { if (!pending) fired.current = false; }, [pending]);
+  if (!pending) return null;
+  const handleRetry = () => {
+    const c = challenges.find((x) => x.id === pending.challengeId);
+    if (c) startAttempt(c.id);
+    dismiss();
+  };
+  return React.createElement('div', { onClick: dismiss, className: 'fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm animate-scaleIn' },
+    React.createElement('div', { onClick: (e) => e.stopPropagation(), className: 'relative w-[min(92vw,420px)] overflow-hidden rounded-3xl border border-cyan-400/30 bg-slate-950/95 p-6 text-center shadow-[0_0_40px_rgba(34,211,238,0.35)]' },
+      React.createElement('button', { onClick: dismiss, className: 'absolute right-3 top-3 rounded-full p-1.5 text-white/50 hover:bg-white/10' }, React.createElement(Icon, { name: 'x', size: 16 })),
+      React.createElement('div', { className: 'mx-auto mb-3 flex h-14 w-14 items-center justify-center rounded-full bg-gradient-to-br from-cyan-400 to-fuchsia-500 shadow-[0_0_24px_rgba(236,72,153,0.5)] animate-scaleIn' }, React.createElement(Icon, { name: 'trophy', size: 28, className: 'text-black' })),
+      React.createElement('div', { className: 'mb-1 text-xs font-medium uppercase tracking-widest text-cyan-300/80' }, 'Challenge Complete'),
+      React.createElement('h2', { className: 'mb-4 text-xl font-bold text-white' }, pending.challengeName),
+      React.createElement('div', { className: 'mb-4 flex justify-center' }, React.createElement(StarRating, { value: pending.stars, size: 56, animate: true })),
+      React.createElement('div', { className: 'mb-4 rounded-xl border border-white/10 bg-black/40 px-4 py-3' },
+        React.createElement('div', { className: 'text-[10px] uppercase tracking-widest text-white/40' }, 'Result'),
+        React.createElement('div', { className: 'font-mono text-2xl font-bold text-cyan-100' }, pending.metricLabel),
+      ),
+      pending.isPersonalBest && pending.stars > 0 && React.createElement('div', { className: 'mb-4 inline-flex items-center gap-1.5 rounded-full border border-amber-300/40 bg-amber-500/15 px-3 py-1 text-xs font-semibold text-amber-200' }, React.createElement(Icon, { name: 'sparkles', size: 14 }), 'Personal Best!'),
+      pending.scoreAwarded > 0 && React.createElement('div', { className: 'mb-5 text-sm text-white/70' }, React.createElement('span', { className: 'text-fuchsia-300' }, `+${pending.scoreAwarded}`), ' score awarded'),
+      React.createElement('div', { className: 'flex gap-2' },
+        React.createElement('button', { onClick: handleRetry, className: 'flex flex-1 items-center justify-center gap-1.5 rounded-xl border border-white/15 px-3 py-2.5 text-sm font-medium text-white/80 hover:bg-white/10' }, React.createElement(Icon, { name: 'rotateCcw', size: 16 }), 'Retry'),
+        React.createElement('button', { onClick: dismiss, className: 'flex-1 rounded-xl bg-gradient-to-r from-cyan-400 to-fuchsia-500 px-3 py-2.5 text-sm font-semibold text-black' }, 'Continue'),
+      ),
+    ),
+  );
+}
+
+    
+// ===== Share dialog =====
+function ShareDialog({ challenge, open, onClose }) {
+  const [copied, setCopied] = React.useState(false);
+  if (!challenge || !open) return null;
+  const shareUrl = buildShareUrl(challenge);
+  const handleCopy = async () => {
+    try { await navigator.clipboard.writeText(shareUrl); setCopied(true); setTimeout(() => setCopied(false), 1800); }
+    catch {
+      const ta = document.createElement('textarea'); ta.value = shareUrl; document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); setCopied(true); setTimeout(() => setCopied(false), 1800); } catch {}
+      document.body.removeChild(ta);
+    }
+  };
+  return React.createElement('div', { onClick: onClose, className: 'fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm animate-scaleIn' },
+    React.createElement('div', { onClick: (e) => e.stopPropagation(), className: 'w-[min(92vw,520px)] overflow-hidden rounded-2xl border border-cyan-400/30 bg-slate-950/95 p-6 text-white' },
+      React.createElement('div', { className: 'mb-4 flex items-center gap-2' }, React.createElement(Icon, { name: 'share', size: 18, className: 'text-cyan-300' }), React.createElement('h2', { className: 'text-lg font-bold text-cyan-100' }, 'Share Challenge')),
+      React.createElement('p', { className: 'mb-4 text-sm text-white/60' }, 'Anyone with this URL can attempt your challenge. The challenge data is encoded as a URL-safe Base64 string — no server required.'),
+      React.createElement('div', { className: 'mb-4 rounded-lg border border-white/10 bg-black/40 p-3' },
+        React.createElement('div', { className: 'mb-1 text-[11px] uppercase tracking-wider text-cyan-200/70' }, 'Challenge'),
+        React.createElement('div', { className: 'font-semibold text-white' }, challenge.name),
+        React.createElement('div', { className: 'text-xs text-white/50' }, challenge.kind === 'radar' ? `Speed Radar · targets ${challenge.targets.join(' / ')} km/h` : `Track Limit · ${challenge.timeTargets.join(' / ')}s cutoffs`),
+      ),
+      React.createElement('div', { className: 'mb-4' },
+        React.createElement('div', { className: 'mb-1 text-[11px] uppercase tracking-wider text-cyan-200/70' }, 'Share URL'),
+        React.createElement('div', { className: 'flex items-center gap-2' },
+          React.createElement('input', { readOnly: true, value: shareUrl, onFocus: (e) => e.target.select(), className: 'flex-1 truncate rounded-lg border border-white/15 bg-black/40 px-3 py-2 font-mono text-xs text-cyan-100 outline-none' }),
+          React.createElement('button', { onClick: handleCopy, className: 'flex items-center gap-1.5 rounded-lg bg-gradient-to-r from-cyan-400 to-fuchsia-500 px-3 py-2 text-xs font-semibold text-black' }, React.createElement(Icon, { name: copied ? 'check' : 'copy', size: 14 }), copied ? 'Copied' : 'Copy'),
+        ),
+      ),
+      React.createElement('div', { className: 'mb-4 rounded-lg border border-amber-400/20 bg-amber-500/5 p-3 text-xs text-amber-200/80' },
+        React.createElement('strong', { className: 'text-amber-200' }, 'Ethical reminder:'), ' Drive safely and obey real-world traffic laws. Benjamin Drives is for entertainment on closed courses or as a passenger.'),
+      React.createElement('div', { className: 'flex justify-end gap-2' },
+        React.createElement('button', { onClick: () => { window.open(shareUrl, '_blank'); onClose(); }, className: 'flex items-center gap-1.5 rounded-lg border border-white/15 px-3 py-2 text-xs font-medium text-white/80 hover:bg-white/10' }, React.createElement(Icon, { name: 'externalLink', size: 14 }), 'Open in new tab'),
+        React.createElement('button', { onClick: onClose, className: 'rounded-lg bg-white/10 px-4 py-2 text-sm font-medium text-white hover:bg-white/20' }, 'Close'),
+      ),
+    ),
+  );
+}
+
+    
+// ===== Challenge creator (click-first flow) =====
+function ChallengeCreator({ onShare }) {
+  const mapMode = useHorizonStore((s) => s.mapMode);
+  const draftRadarPosition = useHorizonStore((s) => s.draftRadarPosition);
+  const draftTrackPoints = useHorizonStore((s) => s.draftTrackPoints);
+  const draftRadius = useHorizonStore((s) => s.draftRadius);
+  const setDraftRadius = useHorizonStore((s) => s.setDraftRadius);
+  const addChallenge = useHorizonStore((s) => s.addChallenge);
+  const clearDraft = useHorizonStore((s) => s.clearDraft);
+  const setMapMode = useHorizonStore((s) => s.setMapMode);
+  const [name, setName] = React.useState('');
+  const [t1, setT1] = React.useState('30');
+  const [t2, setT2] = React.useState('45');
+  const [t3, setT3] = React.useState('60');
+  const [penalty, setPenalty] = React.useState('10');
+  if (mapMode !== 'create-radar' && mapMode !== 'create-track') return null;
+  const isRadar = mapMode === 'create-radar';
+  const geometryReady = isRadar ? !!draftRadarPosition : draftTrackPoints.length >= 3;
+  const canSave = geometryReady && !!name.trim() && [t1, t2, t3].every((t) => Number(t) > 0) && (isRadar ? draftRadius > 0 : Number(penalty) >= 0);
+  const handleSave = () => {
+    if (!canSave) return;
+    const id = `user-${Date.now().toString(36)}`;
+    const targets = [Number(t1), Number(t2), Number(t3)];
+    let challenge;
+    if (isRadar && draftRadarPosition) {
+      challenge = { kind: 'radar', id, name: name.trim(), position: draftRadarPosition, radius: draftRadius, targets };
+    } else {
+      challenge = { kind: 'track', id, name: name.trim(), start: draftTrackPoints[0], finish: draftTrackPoints[draftTrackPoints.length - 1], boundary: draftTrackPoints, timeTargets: targets, onLeaveBoundary: 'penalty', penaltySeconds: Number(penalty) || 10 };
+    }
+    addChallenge(challenge);
+    clearDraft();
+    setMapMode('drive');
+    setName('');
+    onShare(challenge);
+  };
+  return React.createElement('div', { className: 'pointer-events-auto absolute bottom-4 left-1/2 z-20 w-[min(92vw,520px)] -translate-x-1/2 overflow-hidden rounded-2xl border border-cyan-400/30 bg-slate-950/85 shadow-[0_0_24px_rgba(34,211,238,0.25)] backdrop-blur animate-slideUp' },
+    React.createElement('div', { className: 'flex items-center justify-between border-b border-white/10 px-4 py-3' },
+      React.createElement('div', { className: 'flex items-center gap-2' },
+        React.createElement('div', { className: 'flex h-8 w-8 items-center justify-center rounded-full bg-cyan-500/20' }, React.createElement(Icon, { name: isRadar ? 'radar' : 'square', size: 16, className: 'text-cyan-300' })),
+        React.createElement('div', null,
+          React.createElement('div', { className: 'text-sm font-semibold text-cyan-100' }, isRadar ? 'Speed Radar Creator' : 'Track Limit Creator'),
+          React.createElement('div', { className: 'text-[11px] text-white/50' }, isRadar ? 'Click the map to place the radar.' : 'Click the map to drop polygon points (3+). First = start, last = finish.'),
+        ),
+      ),
+      React.createElement('button', { onClick: () => { clearDraft(); setMapMode('drive'); }, className: 'rounded-full p-1.5 text-white/60 hover:bg-white/10' }, React.createElement(Icon, { name: 'x', size: 16 })),
+    ),
+    React.createElement('div', { className: 'space-y-3 px-4 py-4' },
+      React.createElement('div', null,
+        React.createElement('label', { className: 'mb-1 block text-[11px] font-medium uppercase tracking-wider text-cyan-200/80' }, 'Challenge name'),
+        React.createElement('input', { value: name, onChange: (e) => setName(e.target.value), placeholder: isRadar ? 'e.g. Highway 5 Sprint' : 'e.g. Downtown Loop', className: 'w-full rounded-lg border border-white/15 bg-black/40 px-3 py-2 text-sm text-white placeholder-white/30 outline-none focus:border-cyan-400' }),
+      ),
+      React.createElement('div', { className: 'grid grid-cols-3 gap-2' },
+        ['1★ ' + (isRadar ? 'km/h' : 'sec'), '2★ ' + (isRadar ? 'km/h' : 'sec'), '3★ ' + (isRadar ? 'km/h' : 'sec')].map((label, i) => {
+          const val = [t1, t2, t3][i];
+          const set = [setT1, setT2, setT3][i];
+          return React.createElement('div', { key: i },
+            React.createElement('label', { className: 'mb-1 block text-[11px] font-medium uppercase tracking-wider text-cyan-200/80' }, label),
+            React.createElement('input', { type: 'number', value: val, onChange: (e) => set(e.target.value), className: 'w-full rounded-lg border border-white/15 bg-black/40 px-2 py-2 text-sm text-white outline-none focus:border-cyan-400' }),
+          );
+        }),
+      ),
+      !isRadar && React.createElement('div', null,
+        React.createElement('label', { className: 'mb-1 block text-[11px] font-medium uppercase tracking-wider text-cyan-200/80' }, 'Boundary penalty (sec per breach)'),
+        React.createElement('input', { type: 'number', value: penalty, onChange: (e) => setPenalty(e.target.value), className: 'w-full rounded-lg border border-white/15 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-cyan-400' }),
+      ),
+      isRadar && React.createElement('div', null,
+        React.createElement('label', { className: 'mb-1 block text-[11px] font-medium uppercase tracking-wider text-cyan-200/80' }, `Zone radius — ${draftRadius}m`),
+        React.createElement('input', { type: 'range', min: 10, max: 300, step: 5, value: draftRadius, onChange: (e) => setDraftRadius(Number(e.target.value)), className: 'w-full accent-cyan-400' }),
+        React.createElement('div', { className: 'mt-1 flex justify-between text-[10px] text-white/40' }, React.createElement('span', null, '10m'), React.createElement('span', null, '300m')),
+      ),
+      React.createElement('div', { className: 'flex items-center justify-between pt-2' },
+        React.createElement('div', { className: 'text-[11px] text-white/50' }, isRadar ? (draftRadarPosition ? 'Radar placed ✓' : 'Click map to place radar') : `${draftTrackPoints.length} points placed`),
+        React.createElement('div', { className: 'flex gap-2' },
+          React.createElement('button', { onClick: () => { if (isRadar) useHorizonStore.getState().setDraftRadarPosition(null); else useHorizonStore.setState({ draftTrackPoints: draftTrackPoints.slice(0, -1) }); }, disabled: isRadar ? !draftRadarPosition : draftTrackPoints.length === 0, className: 'flex items-center gap-1 rounded-lg border border-white/15 px-3 py-1.5 text-xs font-medium text-white/80 hover:bg-white/10 disabled:opacity-30' }, React.createElement(Icon, { name: 'undo', size: 14 }), 'Undo'),
+          React.createElement('button', { onClick: handleSave, disabled: !canSave, className: 'flex items-center gap-1 rounded-lg bg-gradient-to-r from-cyan-400 to-fuchsia-500 px-3 py-1.5 text-xs font-semibold text-black disabled:opacity-30' }, React.createElement(Icon, { name: 'check', size: 14 }), 'Create & Share'),
+        ),
+      ),
+    ),
+  );
+}
+
+    
+// ===== Challenge list =====
+function ChallengeList({ open, onOpenChange, onShare }) {
+  const challenges = useHorizonStore((s) => s.challenges);
+  const records = useHorizonStore((s) => s.progress.records);
+  const startAttempt = useHorizonStore((s) => s.startAttempt);
+  const removeChallenge = useHorizonStore((s) => s.removeChallenge);
+  const activeAttempt = useHorizonStore((s) => s.activeAttempt);
+  if (!open) return null;
+  return React.createElement(React.Fragment, null,
+    React.createElement('div', { onClick: () => onOpenChange(false), className: 'fixed inset-0 z-30 bg-black/40 backdrop-blur-sm animate-scaleIn' }),
+    React.createElement('div', { className: 'fixed right-0 top-0 z-40 flex h-full w-[min(92vw,380px)] flex-col border-l border-cyan-400/30 bg-slate-950/95 backdrop-blur', style: { animation: 'slideLeft 0.3s ease-out' } },
+      React.createElement('div', { className: 'flex items-center justify-between border-b border-white/10 px-4 py-3' },
+        React.createElement('div', { className: 'flex items-center gap-2' }, React.createElement(Icon, { name: 'trophy', size: 16, className: 'text-amber-300' }), React.createElement('h3', { className: 'font-semibold text-white' }, 'Challenges'), React.createElement('span', { className: 'rounded-full bg-cyan-500/20 px-2 py-0.5 text-[10px] font-semibold text-cyan-200' }, challenges.length)),
+        React.createElement('button', { onClick: () => onOpenChange(false), className: 'rounded-full p-1.5 text-white/60 hover:bg-white/10' }, React.createElement(Icon, { name: 'chevronRight', size: 16 })),
+      ),
+      React.createElement('div', { className: 'hzn-scroll flex-1 overflow-y-auto px-3 py-3' },
+        challenges.length === 0
+          ? React.createElement('div', { className: 'flex flex-col items-center justify-center py-12 text-center text-white/40' }, React.createElement(Icon, { name: 'inbox', size: 40, className: 'mb-2' }), React.createElement('div', { className: 'text-sm' }, 'No challenges yet'), React.createElement('div', { className: 'text-xs' }, 'Enter Creator Mode to make one.'))
+          : React.createElement('div', { className: 'space-y-2' },
+              ...challenges.map((c) => {
+                const isPreset = c.id.startsWith('preset-');
+                const record = records[c.id];
+                const isActive = activeAttempt?.challengeId === c.id;
+                const isRadar = c.kind === 'radar';
+                return React.createElement('div', { key: c.id, className: `rounded-xl border p-3 ${isActive ? 'border-fuchsia-400/50 bg-fuchsia-500/10' : 'border-white/10 bg-black/30'}` },
+                  React.createElement('div', { className: 'flex items-start gap-2' },
+                    React.createElement('div', { className: `flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${isRadar ? 'bg-fuchsia-500/20' : 'bg-emerald-500/20'}` }, React.createElement(Icon, { name: isRadar ? 'radar' : 'flag', size: 16, className: isRadar ? 'text-fuchsia-300' : 'text-emerald-300' })),
+                    React.createElement('div', { className: 'min-w-0 flex-1' },
+                      React.createElement('div', { className: 'truncate text-sm font-semibold text-white' }, c.name),
+                      React.createElement('div', { className: 'text-[11px] text-white/50' }, isRadar ? `Radar · ${c.targets.join(' / ')} km/h` : `Track · ${c.timeTargets.join(' / ')}s`),
+                      record && React.createElement('div', { className: 'mt-1 flex items-center gap-2' }, React.createElement(StarRating, { value: record.bestStars, size: 14 }), React.createElement('span', { className: 'text-[10px] text-white/40' }, `best ${record.bestMetric.toFixed(0)}${isRadar ? ' km/h' : 's'}`)),
+                    ),
+                  ),
+                  React.createElement('div', { className: 'mt-2 flex gap-1.5' },
+                    React.createElement('button', { onClick: () => { startAttempt(c.id); onOpenChange(false); }, disabled: isActive, className: 'flex flex-1 items-center justify-center gap-1 rounded-lg bg-gradient-to-r from-cyan-400 to-fuchsia-500 px-2 py-1.5 text-xs font-semibold text-black disabled:opacity-40' }, React.createElement(Icon, { name: 'play', size: 12 }), isActive ? 'In progress' : 'Attempt'),
+                    React.createElement('button', { onClick: () => onShare(c), className: 'rounded-lg border border-white/15 p-1.5 text-white/70 hover:bg-white/10' }, React.createElement(Icon, { name: 'share', size: 14 })),
+                    !isPreset && React.createElement('button', { onClick: () => removeChallenge(c.id), className: 'rounded-lg border border-white/15 p-1.5 text-white/70 hover:bg-rose-500/20 hover:text-rose-300' }, React.createElement(Icon, { name: 'x', size: 14 })),
+                  ),
+                );
+              }),
+            ),
+      ),
+    ),
+  );
+}
+
+    
+// ===== Challenge HUD (active attempt) =====
+function ChallengeHUD() {
+  const active = useHorizonStore((s) => s.activeAttempt);
+  const challenges = useHorizonStore((s) => s.challenges);
+  const cancelAttempt = useHorizonStore((s) => s.cancelAttempt);
+  const [, force] = React.useState(0);
+  React.useEffect(() => { if (!active) return; const id = setInterval(() => force((n) => n + 1), 100); return () => clearInterval(id); }, [active]);
+  if (!active) return null;
+  const c = challenges.find((x) => x.id === active.challengeId);
+  if (!c) return null;
+  const isRadar = c.kind === 'radar';
+  const elapsed = active.started ? (Date.now() - active.startedAt) / 1000 : 0;
+  return React.createElement('div', { className: 'pointer-events-auto absolute left-4 top-4 z-20 w-[min(90vw,320px)] overflow-hidden rounded-2xl border border-fuchsia-400/30 bg-slate-950/85 shadow-[0_0_20px_rgba(236,72,153,0.3)] backdrop-blur animate-slideLeft' },
+    React.createElement('div', { className: 'flex items-center justify-between border-b border-white/10 bg-fuchsia-500/10 px-3 py-2' },
+      React.createElement('div', { className: 'flex items-center gap-2' },
+        React.createElement(Icon, { name: isRadar ? 'radar' : 'flag', size: 16, className: isRadar ? 'text-fuchsia-300' : 'text-emerald-300' }),
+        React.createElement('div', null,
+          React.createElement('div', { className: 'text-[10px] uppercase tracking-widest text-white/50' }, isRadar ? 'Speed Radar Active' : 'Track Limit Active'),
+          React.createElement('div', { className: 'text-sm font-semibold text-white' }, c.name),
+        ),
+      ),
+      React.createElement('button', { onClick: cancelAttempt, className: 'rounded-full p-1 text-white/50 hover:bg-white/10' }, React.createElement(Icon, { name: 'x', size: 16 })),
+    ),
+    React.createElement('div', { className: 'px-3 py-3 text-sm' },
+      isRadar
+        ? React.createElement('div', { className: 'space-y-2' },
+            React.createElement('div', { className: 'text-xs text-white/70' }, 'Drive through the radar — your speed at crossing will be recorded.'),
+            React.createElement('div', { className: 'flex items-center justify-between rounded-lg bg-black/40 px-2 py-1.5' },
+              React.createElement('span', { className: 'text-[11px] uppercase tracking-wider text-white/40' }, 'Targets'),
+              React.createElement('div', { className: 'flex gap-2 font-mono text-xs' },
+                React.createElement('span', { className: 'text-amber-300' }, `1★ ${c.targets[0]}`),
+                React.createElement('span', { className: 'text-amber-200' }, `2★ ${c.targets[1]}`),
+                React.createElement('span', { className: 'text-amber-100' }, `3★ ${c.targets[2]}`),
+              ),
+            ),
+          )
+        : React.createElement('div', { className: 'space-y-2' },
+            React.createElement('div', { className: 'flex items-center gap-2 rounded-lg bg-black/40 px-2 py-1.5' },
+              React.createElement(Icon, { name: 'timer', size: 14, className: 'text-cyan-300' }),
+              React.createElement('span', { className: 'font-mono text-lg tabular-nums text-cyan-100' }, `${elapsed.toFixed(1)}s`),
+              !active.started && React.createElement('span', { className: 'ml-auto text-[10px] text-emerald-300' }, 'Drive to start →'),
+            ),
+            active.boundaryBreaches > 0 && React.createElement('div', { className: 'flex items-center gap-1.5 rounded-lg border border-amber-400/30 bg-amber-500/10 px-2 py-1.5 text-xs text-amber-200' }, React.createElement(Icon, { name: 'alert', size: 14 }), `${active.boundaryBreaches} boundary breach${active.boundaryBreaches === 1 ? '' : 'es'} · +${(c.penaltySeconds || 0) * active.boundaryBreaches}s`),
+            React.createElement('div', { className: 'flex items-center justify-between text-[11px]' },
+              React.createElement('span', { className: 'uppercase tracking-wider text-white/40' }, 'Star cutoffs'),
+              React.createElement('span', { className: 'font-mono text-white/80' }, `3★ ≤${c.timeTargets[0]}s · 2★ ≤${c.timeTargets[1]}s · 1★ ≤${c.timeTargets[2]}s`),
+            ),
+          ),
+    ),
+  );
+}
+
+    
+// ===== Search bar =====
+function SearchBar() {
+  const [query, setQuery] = React.useState('');
+  const [results, setResults] = React.useState([]);
+  const [loading, setLoading] = React.useState(false);
+  const [open, setOpen] = React.useState(false);
+  const destination = useHorizonStore((s) => s.destination);
+  const setDestination = useHorizonStore((s) => s.setDestination);
+  const setDestinationPin = useHorizonStore((s) => s.setDestinationPin);
+  const destinationPin = useHorizonStore((s) => s.destinationPin);
+  const mapMode = useHorizonStore((s) => s.mapMode);
+  const setMapMode = useHorizonStore((s) => s.setMapMode);
+  const containerRef = React.useRef(null);
+  const abortRef = React.useRef(null);
+  React.useEffect(() => {
+    const handler = (e) => { if (!containerRef.current?.contains(e.target)) setOpen(false); };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
+  React.useEffect(() => {
+    if (query.trim().length < 3) { setResults([]); setLoading(false); return; }
+    setLoading(true);
+    const t = setTimeout(async () => {
+      abortRef.current?.abort();
+      const ctrl = new AbortController();
+      abortRef.current = ctrl;
+      try {
+        const res = await geocode(query, 6);
+        if (!ctrl.signal.aborted) { setResults(res); setOpen(true); }
+      } catch { if (!ctrl.signal.aborted) setResults([]); }
+      finally { if (!ctrl.signal.aborted) setLoading(false); }
+    }, 350);
+    return () => clearTimeout(t);
+  }, [query]);
+  React.useEffect(() => { if (destination) { setQuery(destination.shortName); setOpen(false); } }, [destination]);
+  const handleSelect = (r) => { setDestination(r); setQuery(r.shortName); setOpen(false); };
+  const handleClear = () => { setQuery(''); setResults([]); setOpen(false); setDestination(null); setDestinationPin(null); };
+  const toggleDropPin = () => setMapMode(mapMode === 'set-destination' ? 'drive' : 'set-destination');
+  const hasDest = !!(destination || destinationPin);
+  return React.createElement('div', { ref: containerRef, className: 'pointer-events-auto relative w-[min(70vw,440px)]' },
+    React.createElement('div', { className: `flex items-center gap-2 rounded-2xl border bg-slate-950/90 px-3 py-2 backdrop-blur ${mapMode === 'set-destination' ? 'border-amber-400/60 shadow-[0_0_18px_rgba(251,191,36,0.3)]' : 'border-white/15'}` },
+      React.createElement(Icon, { name: 'search', size: 16, className: 'shrink-0 text-cyan-300' }),
+      React.createElement('input', { value: query, onChange: (e) => { setQuery(e.target.value); if (!e.target.value && hasDest) handleClear(); }, onFocus: () => results.length > 0 && setOpen(true), placeholder: 'Search destination…', className: 'min-w-0 flex-1 bg-transparent text-sm text-white placeholder-white/40 outline-none' }),
+      loading && React.createElement(Icon, { name: 'loader', size: 14, className: 'shrink-0 animate-spin text-cyan-300' }),
+      query && !loading && React.createElement('button', { onClick: handleClear, className: 'shrink-0 rounded-full p-0.5 text-white/40 hover:bg-white/10' }, React.createElement(Icon, { name: 'x', size: 14 })),
+      React.createElement('button', { onClick: toggleDropPin, className: `shrink-0 rounded-full p-1 ${mapMode === 'set-destination' ? 'text-amber-300' : 'text-white/50'}` }, React.createElement(Icon, { name: 'crosshair', size: 14 })),
+    ),
+    open && results.length > 0 && React.createElement('div', { className: 'absolute left-0 right-0 top-full z-30 mt-1 max-h-[60vh] overflow-y-auto rounded-xl border border-white/15 bg-slate-950/95 py-1 backdrop-blur animate-slideDown' },
+      ...results.map((r, i) => React.createElement('button', { key: i, onClick: () => handleSelect(r), className: 'flex w-full items-start gap-2 px-3 py-2 text-left hover:bg-white/5' },
+        React.createElement(Icon, { name: 'mapPin', size: 14, className: 'mt-0.5 shrink-0 text-cyan-300' }),
+        React.createElement('div', { className: 'min-w-0 flex-1' },
+          React.createElement('div', { className: 'truncate text-sm font-medium text-white' }, r.shortName),
+          React.createElement('div', { className: 'truncate text-[11px] text-white/50' }, r.displayName),
+        ),
+      )),
+    ),
+    mapMode === 'set-destination' && React.createElement('div', { className: 'absolute left-1/2 top-full mt-2 -translate-x-1/2 whitespace-nowrap rounded-full border border-amber-400/40 bg-slate-950/90 px-3 py-1 text-[11px] font-medium text-amber-200 backdrop-blur' }, 'Tap the map to drop a destination pin'),
+  );
+}
+
+    
+// ===== Navigation panel =====
+function ManeuverIcon({ type, modifier, size = 32 }) {
+  let name = 'arrowUp';
+  if (type === 'depart') name = 'navigation';
+  else if (type === 'arrive') name = 'flag';
+  else if (type === 'roundabout' || type === 'rotary' || type === 'roundabout turn') name = 'navigation';
+  else if (modifier === 'uturn') name = 'cornerUpLeft';
+  else if (modifier === 'sharp right') name = 'arrowDownRight';
+  else if (modifier === 'right') name = 'arrowRight';
+  else if (modifier === 'slight right') name = 'arrowUpRight';
+  else if (modifier === 'sharp left') name = 'arrowDownLeft';
+  else if (modifier === 'left') name = 'arrowLeft';
+  else if (modifier === 'slight left') name = 'arrowUpLeft';
+  return React.createElement(Icon, { name, size, className: '' });
+}
+
+function NavigationPanel() {
+  const route = useHorizonStore((s) => s.route);
+  const routeLoading = useHorizonStore((s) => s.routeLoading);
+  const routeError = useHorizonStore((s) => s.routeError);
+  const destination = useHorizonStore((s) => s.destination);
+  const destinationPin = useHorizonStore((s) => s.destinationPin);
+  const isNavigating = useHorizonStore((s) => s.isNavigating);
+  const currentStepIndex = useHorizonStore((s) => s.currentStepIndex);
+  const startNavigation = useHorizonStore((s) => s.startNavigation);
+  const stopNavigation = useHorizonStore((s) => s.stopNavigation);
+  const clearNavigation = useHorizonStore((s) => s.clearNavigation);
+  const geo = useHorizonStore((s) => s.geo);
+  const [, force] = React.useState(0);
+  React.useEffect(() => { if (!isNavigating) return; const id = setInterval(() => force((n) => n + 1), 500); return () => clearInterval(id); }, [isNavigating]);
+  if (!destination && !destinationPin) return null;
+  const destLabel = destination?.shortName || 'Dropped pin';
+  if (routeLoading && !route) return React.createElement('div', { className: 'pointer-events-auto w-[min(92vw,460px)] rounded-2xl border border-cyan-400/30 bg-slate-950/95 p-3 backdrop-blur' }, React.createElement('div', { className: 'flex items-center gap-2 text-cyan-100' }, React.createElement(Icon, { name: 'loader', size: 16, className: 'animate-spin' }), React.createElement('span', { className: 'text-sm' }, `Calculating route to ${destLabel}…`)));
+  if (routeError && !route) return React.createElement('div', { className: 'pointer-events-auto w-[min(92vw,460px)] rounded-2xl border border-rose-400/30 bg-slate-950/95 p-3 backdrop-blur' }, React.createElement('div', { className: 'flex items-center gap-2' }, React.createElement(Icon, { name: 'alert', size: 16, className: 'text-rose-400' }), React.createElement('div', { className: 'flex-1' }, React.createElement('div', { className: 'text-sm font-medium text-white' }, 'Couldn\'t find a route'), React.createElement('div', { className: 'text-[11px] text-white/50' }, routeError)), React.createElement('button', { onClick: clearNavigation, className: 'rounded-lg border border-white/15 px-2 py-1 text-xs text-white/80' }, 'Dismiss')));
+  if (!route && !geo) return React.createElement('div', { className: 'pointer-events-auto w-[min(92vw,460px)] rounded-2xl border border-cyan-400/30 bg-slate-950/95 p-3 backdrop-blur' }, React.createElement('div', { className: 'flex items-center gap-2' }, React.createElement(Icon, { name: 'mapPin', size: 16, className: 'text-cyan-300' }), React.createElement('div', { className: 'flex-1' }, React.createElement('div', { className: 'text-sm font-medium text-white' }, destLabel), React.createElement('div', { className: 'text-[11px] text-white/50' }, 'Enable location to calculate route')), React.createElement('button', { onClick: clearNavigation, className: 'rounded-lg border border-white/15 p-1.5 text-white/60' }, React.createElement(Icon, { name: 'x', size: 14 }))));
+  if (!route) return null;
+  if (!isNavigating) return React.createElement('div', { className: 'pointer-events-auto w-[min(92vw,460px)] rounded-2xl border border-cyan-400/30 bg-slate-950/95 p-3 backdrop-blur animate-slideDown' },
+    React.createElement('div', { className: 'flex items-center gap-3' },
+      React.createElement('div', { className: 'flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-cyan-500/15 text-cyan-300' }, React.createElement(Icon, { name: 'mapPin', size: 20 })),
+      React.createElement('div', { className: 'min-w-0 flex-1' },
+        React.createElement('div', { className: 'truncate text-sm font-semibold text-white' }, destLabel),
+        React.createElement('div', { className: 'text-[11px] text-white/60' }, `${formatDistance(route.distance)} · ${formatDuration(route.duration)} · ETA ${formatEtaClock(route.duration)}`),
+      ),
+      React.createElement('button', { onClick: startNavigation, className: 'flex items-center gap-1.5 rounded-xl bg-gradient-to-r from-cyan-400 to-fuchsia-500 px-3 py-2 text-sm font-semibold text-black' }, React.createElement(Icon, { name: 'play', size: 16 }), 'Start'),
+      React.createElement('button', { onClick: clearNavigation, className: 'rounded-lg border border-white/15 p-2 text-white/60' }, React.createElement(Icon, { name: 'x', size: 14 })),
+    ),
+  );
+  const step = route.steps[currentStepIndex];
+  const nextStep = route.steps[currentStepIndex + 1];
+  if (!step) return null;
+  const distToManeuver = geo ? haversineMetres(geo.position, step.maneuver.location) : step.distance;
+  let remDist = step.distance, remDur = step.duration;
+  for (let i = currentStepIndex + 1; i < route.steps.length; i++) { remDist += route.steps[i].distance; remDur += route.steps[i].duration; }
+  return React.createElement('div', { key: currentStepIndex, className: 'pointer-events-auto w-[min(92vw,460px)] overflow-hidden rounded-2xl border border-cyan-400/40 bg-slate-950/95 shadow-[0_0_24px_rgba(34,211,238,0.3)] backdrop-blur animate-slideDown' },
+    React.createElement('div', { className: 'flex items-center gap-3 border-b border-white/10 bg-gradient-to-r from-cyan-500/10 to-transparent px-4 py-3' },
+      React.createElement('div', { className: 'flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-cyan-500/20 text-cyan-300 shadow-[0_0_18px_rgba(34,211,238,0.4)]' }, React.createElement(ManeuverIcon, { type: step.maneuver.type, modifier: step.maneuver.modifier, size: 32 })),
+      React.createElement('div', { className: 'min-w-0 flex-1' },
+        React.createElement('div', { className: 'font-mono text-2xl font-bold leading-none text-white' }, formatDistance(distToManeuver)),
+        React.createElement('div', { className: 'mt-1 truncate text-sm text-cyan-100' }, step.instruction),
+        nextStep && React.createElement('div', { className: 'mt-0.5 truncate text-[11px] text-white/50' }, `Then ${nextStep.instruction.toLowerCase()}`),
+      ),
+    ),
+    React.createElement('div', { className: 'flex items-center justify-between px-4 py-2.5' },
+      React.createElement('div', { className: 'flex items-center gap-4 text-xs' },
+        React.createElement('div', { className: 'flex items-center gap-1.5' }, React.createElement('span', { className: 'font-mono text-base font-bold text-white' }, formatDistance(remDist)), React.createElement('span', { className: 'text-white/40' }, 'remaining')),
+        React.createElement('div', { className: 'h-3 w-px bg-white/15' }),
+        React.createElement('div', { className: 'flex items-center gap-1.5' }, React.createElement('span', { className: 'font-mono text-base font-bold text-cyan-200' }, formatDuration(remDur)), React.createElement('span', { className: 'text-white/40' }, '·'), React.createElement('span', { className: 'text-white/60' }, `ETA ${formatEtaClock(remDur)}`)),
+      ),
+      React.createElement('button', { onClick: stopNavigation, className: 'flex items-center gap-1.5 rounded-lg border border-rose-400/30 bg-rose-500/10 px-3 py-1.5 text-xs font-semibold text-rose-200' }, React.createElement(Icon, { name: 'square', size: 12 }), 'Stop'),
+    ),
+  );
+}
+
+    
+// ===== Top bar (responsive — wraps on narrow screens) =====
+function TopBar({ onOpenList }) {
+  const mapStyle = useHorizonStore((s) => s.mapStyle);
+  const setMapStyle = useHorizonStore((s) => s.setMapStyle);
+  const followUser = useHorizonStore((s) => s.followUser);
+  const setFollowUser = useHorizonStore((s) => s.setFollowUser);
+  const setMapMode = useHorizonStore((s) => s.setMapMode);
+  const mapMode = useHorizonStore((s) => s.mapMode);
+  const totalStars = useHorizonStore((s) => s.progress.totalStars);
+  const totalScore = useHorizonStore((s) => s.progress.totalScore);
+  const challenges = useHorizonStore((s) => s.challenges);
+  const [styleOpen, setStyleOpen] = React.useState(false);
+  const toggleStyle = (s) => { setMapStyle(s); setStyleOpen(false); };
+  const btn = (active, onClick, iconName, title) => React.createElement('button', { onClick, title, 'aria-label': title, className: `flex h-9 w-9 items-center justify-center rounded-full border backdrop-blur shrink-0 ${active ? 'border-cyan-400/50 bg-cyan-500/20 text-cyan-300' : 'border-white/15 bg-slate-950/80 text-white/70'}` }, React.createElement(Icon, { name: iconName, size: 16 }));
+  return React.createElement('div', { className: 'pointer-events-none absolute inset-x-0 top-0 z-20 flex flex-wrap items-start justify-between gap-2 p-2 sm:p-3' },
+    // Left cluster: logo + style + stats badge (stats hidden on small)
+    React.createElement('div', { className: 'pointer-events-auto flex items-center gap-2' },
+      React.createElement('div', { className: 'flex h-9 w-9 items-center justify-center rounded-2xl border border-cyan-400/30 bg-slate-950/80 backdrop-blur shrink-0' }, React.createElement('div', { className: 'flex h-7 w-7 items-center justify-center rounded-lg bg-gradient-to-br from-cyan-400 to-fuchsia-500' }, React.createElement(Icon, { name: 'gauge', size: 16, className: 'text-black' }))),
+      React.createElement('div', { className: 'relative' },
+        React.createElement('button', { onClick: () => setStyleOpen((v) => !v), 'aria-label': 'Map style', className: 'flex h-9 w-9 items-center justify-center rounded-2xl border border-white/15 bg-slate-950/80 text-white backdrop-blur shrink-0' }, React.createElement(Icon, { name: 'layers', size: 16, className: 'text-cyan-300' })),
+        styleOpen && React.createElement('div', { className: 'absolute left-0 top-full mt-1 w-32 rounded-xl border border-white/15 bg-slate-950/95 py-1 backdrop-blur' },
+          React.createElement('button', { onClick: () => toggleStyle('gta'), className: `flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs ${mapStyle === 'gta' ? 'text-cyan-300' : 'text-white/70'}` }, 'GTA'),
+          React.createElement('button', { onClick: () => toggleStyle('satellite'), className: `flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs ${mapStyle === 'satellite' ? 'text-cyan-300' : 'text-white/70'}` }, 'Satellite'),
+        ),
+      ),
+      // Stars/score badge — hidden on small screens
+      React.createElement('div', { className: 'hidden md:flex items-center gap-2 rounded-full border border-amber-300/30 bg-slate-950/80 px-3 py-1.5 backdrop-blur' },
+        React.createElement('div', { className: 'flex items-center gap-1 text-amber-300' }, React.createElement(Icon, { name: 'star', size: 14, className: 'text-amber-300' }), React.createElement('span', { className: 'font-mono text-sm font-bold tabular-nums' }, totalStars)),
+        React.createElement('div', { className: 'h-3 w-px bg-white/20' }),
+        React.createElement('span', { className: 'font-mono text-sm font-bold text-fuchsia-300' }, totalScore.toLocaleString()),
+      ),
+    ),
+    // Right cluster: skill chain (hidden on small) + creator buttons + list
+    React.createElement('div', { className: 'pointer-events-auto flex items-center gap-1.5 sm:gap-2' },
+      React.createElement('div', { className: 'hidden sm:block' }, React.createElement(SkillChainMeter, null)),
+      btn(followUser, () => setFollowUser(!followUser), 'crosshair', 'Follow my location'),
+      btn(mapMode === 'create-radar', () => setMapMode(mapMode === 'create-radar' ? 'drive' : 'create-radar'), 'radar', 'Create Speed Radar'),
+      btn(mapMode === 'create-track', () => setMapMode(mapMode === 'create-track' ? 'drive' : 'create-track'), 'square', 'Create Track Limit'),
+      React.createElement('button', { onClick: onOpenList, title: 'Challenge list', 'aria-label': 'Challenge list', className: 'relative flex h-9 w-9 items-center justify-center rounded-full border border-white/15 bg-slate-950/80 text-white/80 backdrop-blur shrink-0' }, React.createElement(Icon, { name: 'list', size: 16 }), challenges.length > 0 && React.createElement('span', { className: 'absolute -right-1 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-fuchsia-500 px-1 text-[9px] font-bold text-white' }, challenges.length)),
+    ),
+  );
+}
+
+    
+// ===== Map — GTA 5-inspired dark raster style =====
+const GTA_STYLE = {
+  version: 8,
+  sources: {
+    carto: {
+      type: 'raster',
+      tiles: ['https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png','https://b.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png','https://c.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png','https://d.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png'],
+      tileSize: 256,
+      attribution: '&copy; OpenStreetMap &copy; CARTO',
+    },
+  },
+  layers: [
+    { id: 'background', type: 'background', paint: { 'background-color': '#0a0a0c' } },
+    { id: 'carto-dark', type: 'raster', source: 'carto', paint: { 'raster-brightness-min': 0.08, 'raster-brightness-max': 0.75, 'raster-contrast': 0.3, 'raster-saturation': 0.2 } },
+  ],
+};
+const SATELLITE_STYLE = {
+  version: 8,
+  sources: { sat: { type: 'raster', tiles: ['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'], tileSize: 256, attribution: 'Esri, Maxar, Earthstar Geographics' } },
+  layers: [{ id: 'sat', type: 'raster', source: 'sat' }],
+};
+
+function HorizonMap() {
+  const containerRef = React.useRef(null);
+  const mapRef = React.useRef(null);
+  const mapStyle = useHorizonStore((s) => s.mapStyle);
+  const followUser = useHorizonStore((s) => s.followUser);
+  const mapMode = useHorizonStore((s) => s.mapMode);
+  const geo = useHorizonStore((s) => s.geo);
+  const challenges = useHorizonStore((s) => s.challenges);
+  const activeAttempt = useHorizonStore((s) => s.activeAttempt);
+  const destination = useHorizonStore((s) => s.destination);
+  const destinationPin = useHorizonStore((s) => s.destinationPin);
+  const route = useHorizonStore((s) => s.route);
+  const isNavigating = useHorizonStore((s) => s.isNavigating);
+  const currentStepIndex = useHorizonStore((s) => s.currentStepIndex);
+  const draftRadarPosition = useHorizonStore((s) => s.draftRadarPosition);
+  const draftRadius = useHorizonStore((s) => s.draftRadius);
+  const draftTrackPoints = useHorizonStore((s) => s.draftTrackPoints);
+  const setDraftRadarPosition = useHorizonStore((s) => s.setDraftRadarPosition);
+  const addDraftTrackPoint = useHorizonStore((s) => s.addDraftTrackPoint);
+  const setDestinationPin = useHorizonStore((s) => s.setDestinationPin);
+  const setMapMode = useHorizonStore((s) => s.setMapMode);
+  const clearDraft = useHorizonStore((s) => s.clearDraft);
+
+  // Init map
+  React.useEffect(() => {
+    if (!containerRef.current || mapRef.current) return;
+    mapRef.current = new maplibregl.Map({
+      container: containerRef.current,
+      style: GTA_STYLE,
+      center: DEFAULT_VIEW.center,
+      zoom: DEFAULT_VIEW.zoom,
+      attributionControl: { compact: true },
+    });
+    mapRef.current.on('click', (e) => {
+      const { lng, lat } = e.lngLat;
+      // Read the latest state via getState() so the handler always sees
+      // the current mapMode (the closure would otherwise be stuck on
+      // the value from the first render, when mapMode was 'drive').
+      const state = useHorizonStore.getState();
+      const mode = state.mapMode;
+      if (mode === 'create-radar') state.setDraftRadarPosition([lng, lat]);
+      else if (mode === 'create-track') state.addDraftTrackPoint([lng, lat]);
+      else if (mode === 'set-destination') { state.setDestinationPin([lng, lat]); state.setMapMode('drive'); }
+    });
+    return () => { mapRef.current?.remove(); mapRef.current = null; };
+  }, []);
+
+  // Switch style (skip first render — map already initialized with GTA_STYLE)
+  const firstStyleRun = React.useRef(true);
+  React.useEffect(() => {
+    if (!mapRef.current || firstStyleRun.current) { firstStyleRun.current = false; return; }
+    const apply = () => {
+      try { mapRef.current.setStyle(mapStyle === 'satellite' ? SATELLITE_STYLE : GTA_STYLE); } catch (e) {}
+    };
+    if (mapRef.current.loaded()) apply();
+    else mapRef.current.once('load', apply);
+  }, [mapStyle]);
+
+  // Follow user — use jumpTo during navigation (instant, no animation lag),
+  // easeTo when idle (gentle animated pan)
+  React.useEffect(() => {
+    if (!followUser || !geo || !mapRef.current) return;
+    if (isNavigating) {
+      mapRef.current.jumpTo({ center: geo.position, bearing: geo.heading || 0, zoom: 16, pitch: 45 });
+    } else {
+      mapRef.current.easeTo({ center: geo.position, bearing: geo.heading || 0, pitch: 0, duration: 600 });
+    }
+  }, [geo?.position[0], geo?.position[1], geo?.heading, followUser, isNavigating]);
+
+  // Fit bounds on route preview
+  React.useEffect(() => {
+    if (!route || isNavigating || !mapRef.current) return;
+    const coords = route.geometry.coordinates;
+    if (coords.length < 2) return;
+    const bounds = coords.reduce((acc, [lng, lat]) => acc.extend([lng, lat]), new maplibregl.LngLatBounds(coords[0], coords[0]));
+    mapRef.current.fitBounds(bounds, { padding: 80, duration: 800 });
+  }, [route, isNavigating]);
+
+  // Render all overlays via direct maplibre source/layer updates
+  React.useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const render = () => {
+      try {
+      // ---- Helper: ensure a geojson source exists ----
+      const ensureSource = (id, data) => {
+        if (map.getSource(id)) map.getSource(id).setData(data);
+        else map.addSource(id, { type: 'geojson', data });
+      };
+      const ensureLayer = (id, type, paint, layout) => {
+        if (!map.getLayer(id)) map.addLayer({ id, type, source: id.split('-')[0], paint, layout });
+        else map.setPaintProperty(id, Object.keys(paint)[0], Object.values(paint)[0]);
+      };
+
+      // ---- Route line ----
+      if (route) {
+        ensureSource('route', { type: 'Feature', properties: {}, geometry: route.geometry });
+        if (!map.getLayer('route-glow')) map.addLayer({ id: 'route-glow', type: 'line', source: 'route', layout: { 'line-cap': 'round', 'line-join': 'round' }, paint: { 'line-color': '#22d3ee', 'line-width': 10, 'line-opacity': 0.2, 'line-blur': 6 } });
+        if (!map.getLayer('route-main')) map.addLayer({ id: 'route-main', type: 'line', source: 'route', layout: { 'line-cap': 'round', 'line-join': 'round' }, paint: { 'line-color': isNavigating ? '#67e8f9' : '#22d3ee', 'line-width': isNavigating ? 4 : 5, 'line-opacity': isNavigating ? 0.5 : 0.9 } });
+        else { map.setPaintProperty('route-main', 'line-color', isNavigating ? '#67e8f9' : '#22d3ee'); map.setPaintProperty('route-main', 'line-width', isNavigating ? 4 : 5); map.setPaintProperty('route-main', 'line-opacity', isNavigating ? 0.5 : 0.9); }
+      } else {
+        if (map.getLayer('route-glow')) map.removeLayer('route-glow');
+        if (map.getLayer('route-main')) map.removeLayer('route-main');
+        if (map.getSource('route')) map.removeSource('route');
+      }
+
+      // ---- Radar circular zones (purple transparent circles) ----
+      challenges.filter((c) => c.kind === 'radar').forEach((c) => {
+        const id = `radar-${c.id}`;
+        const radius = c.radius || 50;
+        const ring = circleToPolygon(c.position, radius);
+        ensureSource(id, { type: 'Feature', properties: {}, geometry: { type: 'Polygon', coordinates: [ring] } });
+        if (!map.getLayer(`${id}-fill`)) map.addLayer({ id: `${id}-fill`, type: 'fill', source: id, paint: { 'fill-color': '#a855f7', 'fill-opacity': 0.2 } });
+        if (!map.getLayer(`${id}-line`)) map.addLayer({ id: `${id}-line`, type: 'line', source: id, paint: { 'line-color': '#c084fc', 'line-width': 2, 'line-opacity': 0.7 } });
+      });
+
+      // ---- Draft radar zone (creator mode — live radius preview) ----
+      if (mapMode === 'create-radar' && draftRadarPosition) {
+        const radius = draftRadius || 50;
+        const ring = circleToPolygon(draftRadarPosition, radius);
+        ensureSource('draft-radar-zone', { type: 'Feature', properties: {}, geometry: { type: 'Polygon', coordinates: [ring] } });
+        if (!map.getLayer('draft-radar-fill')) map.addLayer({ id: 'draft-radar-fill', type: 'fill', source: 'draft-radar-zone', paint: { 'fill-color': '#22d3ee', 'fill-opacity': 0.15 } });
+        if (!map.getLayer('draft-radar-line')) map.addLayer({ id: 'draft-radar-line', type: 'line', source: 'draft-radar-zone', paint: { 'line-color': '#67e8f9', 'line-width': 2, 'line-dasharray': [2, 1] } });
+      } else {
+        ['draft-radar-fill', 'draft-radar-line'].forEach((l) => { if (map.getLayer(l)) map.removeLayer(l); });
+        if (map.getSource('draft-radar-zone')) map.removeSource('draft-radar-zone');
+      }
+
+      // ---- Track-limit polygons ----
+      challenges.filter((c) => c.kind === 'track').forEach((c) => {
+        const id = `track-${c.id}`;
+        const ring = (c.boundary[0][0] === c.boundary[c.boundary.length-1][0] && c.boundary[0][1] === c.boundary[c.boundary.length-1][1]) ? c.boundary : [...c.boundary, c.boundary[0]];
+        const isActive = activeAttempt?.challengeId === c.id;
+        ensureSource(id, { type: 'Feature', properties: {}, geometry: { type: 'Polygon', coordinates: [ring] } });
+        if (!map.getLayer(`${id}-fill`)) map.addLayer({ id: `${id}-fill`, type: 'fill', source: id, paint: { 'fill-color': '#ff2bd6', 'fill-opacity': isActive ? 0.25 : 0.1 } });
+        else map.setPaintProperty(`${id}-fill`, 'fill-opacity', isActive ? 0.25 : 0.1);
+        if (!map.getLayer(`${id}-line`)) map.addLayer({ id: `${id}-line`, type: 'line', source: id, paint: { 'line-color': isActive ? '#ff2bd6' : '#7d3c98', 'line-width': isActive ? 3 : 1.5, 'line-dasharray': [2, 1] } });
+      });
+
+      // ---- Draft polygon (creator mode) ----
+      if (mapMode === 'create-track' && draftTrackPoints.length >= 3) {
+        ensureSource('draft-poly', { type: 'Feature', properties: {}, geometry: { type: 'Polygon', coordinates: [[...draftTrackPoints, draftTrackPoints[0]]] } });
+        if (!map.getLayer('draft-poly-fill')) map.addLayer({ id: 'draft-poly-fill', type: 'fill', source: 'draft-poly', paint: { 'fill-color': '#22d3ee', 'fill-opacity': 0.15 } });
+        if (!map.getLayer('draft-poly-line')) map.addLayer({ id: 'draft-poly-line', type: 'line', source: 'draft-poly', paint: { 'line-color': '#22d3ee', 'line-width': 2, 'line-dasharray': [2, 1] } });
+      } else {
+        ['draft-poly-fill', 'draft-poly-line'].forEach((l) => { if (map.getLayer(l)) map.removeLayer(l); });
+        if (map.getSource('draft-poly')) map.removeSource('draft-poly');
+      }
+      } catch (err) { console.error('HorizonMap render error:', err?.message); }
+    };
+    if (map.loaded()) render();
+    else map.once('load', render);
+    // Re-render on relevant state changes
+    return () => {};
+  }, [route, isNavigating, challenges, activeAttempt, mapMode, draftTrackPoints, draftRadarPosition, draftRadius]);
+
+  // Markers management (React-side)
+  const markersRef = React.useRef({});
+  React.useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    try {
+    // Helper: create or get a marker, always set LngLat before addTo
+    const upsertMarker = (id, lngLat, makeEl, anchor = 'bottom') => {
+      if (!markersRef.current[id]) {
+        const el = makeEl();
+        markersRef.current[id] = new maplibregl.Marker({ element: el, anchor }).setLngLat(lngLat).addTo(map);
+      } else {
+        markersRef.current[id].setLngLat(lngLat);
+      }
+      return markersRef.current[id];
+    };
+    // Player marker
+    if (geo && geo.position && geo.position.length === 2) {
+      upsertMarker('player', geo.position, () => {
+        const el = document.createElement('div');
+        el.style.cssText = 'display:flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:50%;background:rgba(34,211,238,0.8);border:2px solid #cffafe;box-shadow:0 0 12px #22d3ee;';
+        el.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="3 11 22 2 13 21 11 13 3 11"/></svg>';
+        return el;
+      }, 'center').setRotation(geo.heading || 0);
+    }
+    // Challenge markers
+    challenges.forEach((c) => {
+      if (c.kind === 'radar') {
+        const id = `c-${c.id}`;
+        const isActive = activeAttempt?.challengeId === c.id;
+        upsertMarker(id, c.position, () => {
+          const el = document.createElement('div');
+          el.style.cssText = `display:flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:50%;border:2px solid ${isActive ? '#f0abfc' : 'rgba(217,70,239,0.6)'};background:${isActive ? 'rgba(236,72,153,0.8)' : 'rgba(112,26,77,0.8)'};box-shadow:${isActive ? '0 0 16px #ec4899' : 'none'};`;
+          el.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fdf4ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19.07 4.93A10 10 0 014.93 19.07A10 10 0 0119.07 4.93z"/><path d="M12 12l4-4"/></svg>';
+          el.title = c.name;
+          return el;
+        });
+      } else {
+        const idS = `c-${c.id}-s`;
+        const idF = `c-${c.id}-f`;
+        const isActive = activeAttempt?.challengeId === c.id;
+        upsertMarker(idS, c.start, () => {
+          const el = document.createElement('div');
+          el.style.cssText = `display:flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:50%;border:2px solid ${isActive ? '#6ee7b7' : 'rgba(52,211,153,0.6)'};background:${isActive ? 'rgba(16,185,129,0.8)' : 'rgba(6,78,59,0.8)'};box-shadow:${isActive ? '0 0 16px #10b981' : 'none'};`;
+          el.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#ecfdf5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><path d="M4 22V15"/></svg>';
+          return el;
+        });
+        upsertMarker(idF, c.finish, () => {
+          const el = document.createElement('div');
+          el.style.cssText = `display:flex;align-items:center;justify-content:center;width:32px;height:32px;border:2px solid ${isActive ? '#fcd34d' : 'rgba(245,158,11,0.6)'};background:${isActive ? 'rgba(245,158,11,0.8)' : 'rgba(120,53,15,0.8)'};box-shadow:${isActive ? '0 0 16px #f59e0b' : 'none'};clip-path:polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);`;
+          el.innerHTML = '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#fffbeb" stroke-width="2"><rect x="3" y="3" width="18" height="18"/></svg>';
+          return el;
+        }, 'center');
+      }
+    });
+    // Destination marker
+    const dest = destination?.position || destinationPin;
+    if (dest) {
+      upsertMarker('dest', dest, () => {
+        const el = document.createElement('div');
+        el.style.cssText = 'position:relative;display:flex;flex-direction:column;align-items:center;';
+        el.innerHTML = '<div style="position:absolute;bottom:-4px;left:50%;transform:translateX(-50%);width:24px;height:24px;border-radius:50%;background:rgba(34,211,238,0.4);animation:ping 2s infinite;"></div><div style="position:relative;display:flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:50%;border:2px solid #cffafe;background:rgba(34,211,238,0.9);box-shadow:0 0 18px #22d3ee;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0118 0z"/><circle cx="12" cy="10" r="3"/></svg></div><div style="width:2px;height:8px;background:rgba(103,232,249,0.6);"></div>';
+        return el;
+      });
+    } else if (markersRef.current['dest']) {
+      markersRef.current['dest'].remove();
+      delete markersRef.current['dest'];
+    }
+    // Draft radar marker
+    if (mapMode === 'create-radar' && draftRadarPosition) {
+      upsertMarker('draft-radar', draftRadarPosition, () => {
+        const el = document.createElement('div');
+        el.style.cssText = 'display:flex;flex-direction:column;align-items:center;';
+        el.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;width:40px;height:40px;border-radius:50%;border:2px solid #cffafe;background:rgba(34,211,238,0.8);box-shadow:0 0 20px #22d3ee;"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19.07 4.93A10 10 0 014.93 19.07A10 10 0 0119.07 4.93z"/><path d="M12 12l4-4"/></svg></div><div style="margin-top:4px;font-size:10px;font-weight:600;color:#a5f3fc;">Tap "Create" to save</div>';
+        return el;
+      });
+    } else if (markersRef.current['draft-radar']) {
+      markersRef.current['draft-radar'].remove();
+      delete markersRef.current['draft-radar'];
+    }
+    // Draft track points
+    draftTrackPoints.forEach((p, i) => {
+      const id = `draft-tp-${i}`;
+      upsertMarker(id, p, () => {
+        const el = document.createElement('div');
+        el.style.cssText = 'display:flex;align-items:center;justify-content:center;width:20px;height:20px;border-radius:50%;border:1px solid #cffafe;background:rgba(8,145,178,0.8);color:white;font-size:9px;font-weight:bold;';
+        el.textContent = i === 0 ? 'S' : (i === draftTrackPoints.length - 1 ? 'F' : String(i));
+        return el;
+      }, 'center');
+    });
+    // Clean up stale draft track points
+    Object.keys(markersRef.current).forEach((k) => {
+      if (k.startsWith('draft-tp-')) {
+        const idx = Number(k.replace('draft-tp-', ''));
+        if (idx >= draftTrackPoints.length) { markersRef.current[k].remove(); delete markersRef.current[k]; }
+      }
+    });
+    } catch (err) {
+      console.error('HorizonMap markers error:', err?.message);
+    }
+  }, [geo, challenges, activeAttempt, destination, destinationPin, mapMode, draftRadarPosition, draftTrackPoints]);
+
+  // Escape to exit creator mode
+  React.useEffect(() => {
+    const handler = (e) => { if (e.key === 'Escape') { clearDraft(); setMapMode('drive'); } };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [clearDraft, setMapMode]);
+
+  const cursorClass = mapMode === 'drive' ? 'cursor-grab' : 'cursor-crosshair';
+  return React.createElement('div', { ref: containerRef, className: `h-full w-full ${cursorClass}` });
+}
+
+    
+// ===== Main App =====
+function App() {
+  useGeolocation({ highAccuracy: true, throttleMs: 800 });
+  useChallengeDetection();
+  useNavigation();
+
+  const setImportedChallenge = useHorizonStore((s) => s.setImportedChallenge);
+  const mapMode = useHorizonStore((s) => s.mapMode);
+  const isNavigating = useHorizonStore((s) => s.isNavigating);
+  const [listOpen, setListOpen] = React.useState(false);
+  const [shareTarget, setShareTarget] = React.useState(null);
+  const [shareOpen, setShareOpen] = React.useState(false);
+
+  React.useEffect(() => {
+    try {
+      const c = readChallengeFromUrl(window.location.search);
+      if (c) setImportedChallenge(c);
+    } catch (err) { console.warn('Failed to decode shared challenge:', err); }
+  }, [setImportedChallenge]);
+
+  const handleShare = (c) => { setShareTarget(c); setShareOpen(true); };
+
+  return React.createElement('main', { className: 'relative h-[100dvh] w-screen overflow-hidden bg-slate-950' },
+    React.createElement(HorizonMap, null),
+    React.createElement(TopBar, { onOpenList: () => setListOpen(true) }),
+    // Search bar — on its own row below the top bar on mobile, centered on desktop
+    !isNavigating && React.createElement('div', { className: 'pointer-events-none absolute inset-x-0 top-14 z-20 flex justify-center px-3 sm:top-3 sm:px-24 md:px-28' }, React.createElement(SearchBar, null)),
+    React.createElement('div', { className: 'pointer-events-none absolute inset-x-0 top-14 z-20 flex justify-center px-3 sm:top-3 sm:px-24 md:px-28' }, React.createElement(NavigationPanel, null)),
+    React.createElement('div', { className: 'absolute left-0 top-28 z-10 sm:top-16' }, React.createElement(ChallengeHUD, null)),
+    React.createElement('div', { className: 'pointer-events-none absolute bottom-12 left-4 z-10 hidden sm:block' }, React.createElement(Speedometer, { size: 170 })),
+    React.createElement('div', { className: 'pointer-events-none absolute bottom-12 left-1/2 z-10 -translate-x-1/2 sm:hidden' }, React.createElement(Speedometer, { size: 130 })),
+    (mapMode === 'create-radar' || mapMode === 'create-track') && React.createElement(ChallengeCreator, { onShare: handleShare }),
+    React.createElement(ImportedChallengeBanner, null),
+    React.createElement(GeoPermissionCard, null),
+    React.createElement(ChallengeList, { open: listOpen, onOpenChange: setListOpen, onShare: handleShare }),
+    React.createElement(ChallengeResultModal, null),
+    React.createElement(ShareDialog, { challenge: shareTarget, open: shareOpen, onClose: () => setShareOpen(false) }),
+    React.createElement(SafetyDisclaimer, null),
+  );
+}
+
+// ===== Mount =====
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(App));
+
+  </script>
+</body>
+</html>
